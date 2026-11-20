@@ -13,6 +13,7 @@ setup_interfaces()
   case "$board" in
   airoha,en7523-evb | \
   askey,rtf8225vw | \
+  fiberhome,hg6145f3 | \
   mitrastar,gpt-2742gx4x5v6 | \
   skyworth,gn630v | \
   tplink,xx230v-v1)

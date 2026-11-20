@@ -20,6 +20,29 @@ define Device/askey_rtf8225vw
 endef
 TARGET_DEVICES += askey_rtf8225vw
 
+define Device/fiberhome_hg6145f3
+  $(Device/FitImage)
+  DEVICE_VENDOR := Fiberhome
+  DEVICE_MODEL := HG6145F3
+  UBINIZE_OPTS := -E 5
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  UBOOTENV_IN_UBI := 1
+  KERNEL_IN_UBI := 1
+  KERNEL := kernel-bin | gzip
+  KERNEL_INITRAMFS := kernel-bin | gzip | \
+    fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb with-initrd | pad-to 128k
+  IMAGES := sysupgrade.bin
+  IMAGE/sysupgrade.bin := append-kernel | \
+    fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb external-static-with-rootfs | \
+    append-metadata
+  DEVICE_PACKAGES += fitblk hostapd-mbedtls wpa-supplicant-mbedtls \
+    kmod-mt7915e kmod-mt7915-firmware kmod-mt7916-firmware \
+    airoha-en7571-firmware airoha-en7523-kite-npu-firmware \
+    kmod-usb-ohci kmod-usb3
+endef
+TARGET_DEVICES += fiberhome_hg6145f3
+
 define Device/genexis_arcee
   $(Device/FitImage)
   DEVICE_VENDOR := Heimgard

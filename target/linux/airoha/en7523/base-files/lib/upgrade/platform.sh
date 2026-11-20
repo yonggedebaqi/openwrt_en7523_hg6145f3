@@ -75,6 +75,7 @@ platform_do_upgrade() {
 
   case "$board" in
   askey,rtf8225vw |\
+  fiberhome,hg6145f3 |\
   genexis,arcee |\
   genexis,e650 |\
   genexis,laxy |\
@@ -104,6 +105,7 @@ platform_check_image() {
 
   case "$board" in
   askey,rtf8225vw |\
+  fiberhome,hg6145f3 |\
   genexis,arcee |\
   genexis,e650 |\
   genexis,laxy |\
