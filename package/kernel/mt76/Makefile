@@ -478,9 +478,10 @@ ifdef CONFIG_PACKAGE_kmod-mt7915e
   PKG_MAKE_FLAGS += CONFIG_MT7915E=m
   ifdef CONFIG_TARGET_airoha_en7523
     PKG_MAKE_FLAGS += CONFIG_MT76_NPU=y
-    PKG_MAKE_FLAGS += CONFIG_MT7915_NPU=y
     NOSTDINC_FLAGS += -DCONFIG_MT76_NPU
-    NOSTDINC_FLAGS += -DCONFIG_MT7915_NPU
+    # CONFIG_MT7915_NPU (mt76 patch 0301) needs airoha_npu_wlan_chip /
+    # AIROHA_PPE_RX_GEM_NONE kernel APIs that are not yet in the
+    # patches-6.18 tree; re-enable together with that patch.
   endif
   ifdef CONFIG_TARGET_mediatek_filogic
     PKG_MAKE_FLAGS += CONFIG_MT798X_WMAC=y
