@@ -21,7 +21,7 @@ endef
 TARGET_DEVICES += askey_rtf8225vw
 
 define Device/fiberhome_hg6145f3
-  $(Device/FitImage)
+  $(Device/Uboot-FitImage)
   DEVICE_VENDOR := Fiberhome
   DEVICE_MODEL := HG6145F3
   UBINIZE_OPTS := -E 5
@@ -36,7 +36,9 @@ define Device/fiberhome_hg6145f3
   IMAGE/sysupgrade.bin := append-kernel | \
     fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb external-static-with-rootfs | \
     append-metadata
-  DEVICE_PACKAGES += fitblk hostapd-mbedtls wpa-supplicant-mbedtls \
+  ARTIFACTS += uboot-bootloader.bin
+  ARTIFACT/uboot-bootloader.bin := bootloader-atf | fill-zero 0x100000
+  DEVICE_PACKAGES += hostapd-mbedtls wpa-supplicant-mbedtls \
     kmod-mt7915e kmod-mt7915-firmware kmod-mt7916-firmware \
     airoha-en7571-firmware airoha-en7523-kite-npu-firmware \
     kmod-usb-ohci kmod-usb3

@@ -151,6 +151,18 @@ define U-Boot/en7523_tplink_xx230v-v1
 endef
 UBOOT_TARGETS += en7523_tplink_xx230v-v1
 
+define U-Boot/en7523_fiberhome_hg6145f3
+  NAME:=Fiberhome HG6145F3
+  UBOOT_IMAGE:=u-boot.bin
+  UBOOT_CONFIG:=en7523-fiberhome_hg6145f3
+  BUILD_SUBTARGET:=en7523
+  BUILD_DEVICES:=fiberhome_hg6145f3
+  BL2_IMAGE:=en7523-bl2.bin
+  BL31_IMAGE:=en7523-bl31.bin
+  DEPENDS:=+trusted-firmware-a-en7523-bl1 +trusted-firmware-a-en7523-bl2 +trusted-firmware-a-en7523-bl31
+endef
+UBOOT_TARGETS += en7523_fiberhome_hg6145f3
+
 define U-Boot/en751221_reference
   NAME:=Genric en751221
   UBOOT_IMAGE:=u-boot.bin
