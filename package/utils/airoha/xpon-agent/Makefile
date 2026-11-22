@@ -34,11 +34,13 @@ endef
 define Build/Compile
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_CPPFLAGS) \
 		-fPIC -Wall -Wextra -Werror \
+		-Wno-error=cpp -Wno-error=sign-compare \
 		-I$(STAGING_DIR)/usr/include -I$(LINUX_DIR)/include/uapi \
 		-o $(PKG_BUILD_DIR)/xpon_omci.so $(PKG_BUILD_DIR)/omci_ucode.c \
 		-shared $(TARGET_LDFLAGS) -lucode
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_CPPFLAGS) \
 		-fPIC -Wall -Wextra -Werror \
+		-Wno-error=cpp -Wno-error=sign-compare \
 		-I$(STAGING_DIR)/usr/include -I$(LINUX_DIR)/include/uapi \
 		-o $(PKG_BUILD_DIR)/xpon.so $(PKG_BUILD_DIR)/xpon_ucode.c \
 		-shared $(TARGET_LDFLAGS) -lucode
