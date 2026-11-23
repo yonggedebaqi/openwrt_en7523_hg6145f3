@@ -1,0 +1,63 @@
+Subject: airoha: xpon: add missing uapi enumerations used by xpon-agent
+
+The xpon-agent userspace module references XPON_ATTR_* and XPON_CMD_*
+enumerators that were never added to this header, so
+package/utils/airoha/xpon-agent fails to build. Append them at the
+end of each enum so existing numeric values stay stable; kernel
+netlink handlers for the new commands will follow with the upstream
+update.
+
+--- a/include/uapi/linux/xpon.h
++++ b/include/uapi/linux/xpon.h
+@@ -29,6 +29,13 @@
+ 	XPON_CMD_SET_MODE,
+ 	XPON_CMD_EVENT,
+ 
++	XPON_CMD_LINK_GET,
++	XPON_CMD_LINK_SET,
++	XPON_CMD_UNI_GET,
++	XPON_CMD_ENDPOINT_GET,
++	XPON_CMD_REPORT_GET,
++	XPON_CMD_REPORT_SET,
++
+ 	__XPON_CMD_MAX,
+ };
+ #define XPON_CMD_MAX (__XPON_CMD_MAX - 1)
+@@ -44,6 +51,37 @@
+ 	XPON_ATTR_LOS,
+ 	XPON_ATTR_CHANGED,
+ 
++	/* object identity */
++	XPON_ATTR_PAD,
++	XPON_ATTR_ID,
++	XPON_ATTR_TYPE,
++	XPON_ATTR_NAME,
++	XPON_ATTR_ONU_TYPE,
++	XPON_ATTR_UNI_COUNT,
++	XPON_ATTR_WIRE_ID,
++
++	/* capabilities and limits */
++	XPON_ATTR_CAPABILITIES,
++	XPON_ATTR_MAX_LINKS,
++	XPON_ATTR_MAX_ENDPOINTS,
++	XPON_ATTR_MAX_QUEUES,
++	XPON_ATTR_MAX_REPORT_SETS,
++	XPON_ATTR_REPORT_SETS,
++
++	/* link and queue state */
++	XPON_ATTR_LINK_ID,
++	XPON_ATTR_LINK_STATE,
++	XPON_ATTR_QUEUE,
++	XPON_ATTR_ENABLED,
++	XPON_ATTR_SCHEDULER_ID,
++	XPON_ATTR_NETDEV_IFINDEX,
++
++	/* statistics and DBA report */
++	XPON_ATTR_RX_PACKETS,
++	XPON_ATTR_TX_PACKETS,
++	XPON_ATTR_REPORT_SET,
++	XPON_ATTR_THRESHOLD_TQ,
++
+ 	__XPON_ATTR_MAX,
+ };
+ #define XPON_ATTR_MAX (__XPON_ATTR_MAX - 1)
