@@ -1,0 +1,68 @@
+config xg140g-pon "onu"
+	# MAC/PHY paths: 1=GPON, 2=EPON, 3=XEPON-ASYM, 4=XEPON-SYM,
+	# 5=1G EPON through the 10G MAC, 6=XG-PON, 7=XGS-PON.
+	# Automatic and manual selection share modes 1..7. Modes 2 and 5 are
+	# two MAC paths for the same 1G EPON protocol, not different line rates.
+	# NGPON2 (8..10) and Turbo-EPON (12) lack a complete startup chain.
+	# 0 = unidentified: candidate modes live in adapt.scan_mode, not here.
+	# Stable O5/MPCP registration promotes the proven mode atomically.
+	option mode "0"
+	option onu_type "02"
+
+	# Device identity — provision per board at install time; no subscriber
+	# identity is embedded in the distributable image.  All PON families share
+	# these fields; empty or unusual text is retained for runtime normalization.
+	# trans_index: EN7572 internal table entry (0..93, or -1 for auto-detect).
+	option ethaddr ""
+	option trans_index "-1"
+
+	# ITU identity: PLOAM password (10 octets) and Registration-ID (36).
+	# The LOID password below is independent of both.
+	option gpon_sn ""
+	option gpon_regid ""
+	option ploam_password ""
+	option ploam_format "ascii"
+	option regid_format "ascii"
+	option credential_schema "2"
+	# All supported boards use one fixed EN7581/EN7572 HGU VEIP model.
+	# Auto selects linux-vlan when network.wan.device is pon.<VID>, otherwise
+	# it follows the literal OMCI VEIP graph.
+	option wan_binding "auto"
+	# Optional 128-bit enhanced-security PSK, encoded as 32 hex digits.
+	option omci_psk ""
+
+	# LOID authentication (China Telecom CTC)
+	option loid ""
+	option password ""
+
+	# CTC OAM Local Information defaults (may be overridden per-operator)
+	option oam_oui "00:0d:b6"
+	option oam_vendor_info "4d:15:01:00"
+
+# PCS-based detection with journaled 3/4 and 6/7 PHY/MAC hot transitions.
+# Other mode changes use the bounded cold-boot recovery path.
+# Existing explicit enabled/auto=0 values survive sysupgrade.
+config xg140g-pon "adapt"
+	option enabled "1"
+	option auto "1"
+	# Pre-MAC RX family probe; startup failure disables this fast path.
+	option boot_probe "1"
+	option hot_switch "1"
+	option rx_power_min "2"
+	option enable_gpon_switch "1"
+	# Stock 1G EPON mode 5 requires separate optical/OLT validation.
+	option extended_modes "1"
+	# Allow a complete reboot when a candidate cannot use the sibling hot path.
+	# Existing explicit cold_fallback=0 is preserved across upgrades.
+	option cold_fallback "1"
+	option cold_schema "1"
+	option cold_mask "0"
+	option cold_count "0"
+	option cold_family "0"
+	option cold_last_good "0"
+	option cold_pending "0"
+
+# RI identifies stock units automatically. If RI was erased by an earlier
+# flat-UBI conversion, an explicit physical model may be retained here.
+config xg140g-pon "hardware"
+	option model "auto"

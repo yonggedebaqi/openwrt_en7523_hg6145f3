@@ -1,0 +1,161 @@
+#!/bin/sh /etc/rc.common
+# OMCI is enabled for GPON/XG-PON/XGS-PON (mode 1/6/7).
+# EPON/XEPON (mode 2/3/4/5) is managed by the kernel IEEE 802.3ah OAM
+# path; starting omcid there would load the wrong management protocol.
+START=41
+STOP=59
+USE_PROCD=1
+IDENTITY_FILE=/var/run/pon.omci_identity
+PSK_FILE=/var/run/pon.omci_psk
+PROFILE_FILE=/var/run/pon.omci_profile
+
+get_value() { local value; config_get value onu "$1"; echo "$value"; }
+
+write_identity() {
+	local loid="$1" password="$2" tmp size rc
+    # Never authenticate a silently truncated identity. UCI may retain a
+    # draft, but startup must reject values that the protocol cannot carry.
+    [ "${#loid}" -le 24 ] && [ "${#password}" -le 12 ] || {
+        rm -f "$IDENTITY_FILE"; return 1;
+    }
+
+	tmp="$(mktemp "${IDENTITY_FILE}.XXXXXX")" || return 1
+	(
+		umask 077
+		dd if=/dev/zero of="$tmp" bs=36 count=1 2>/dev/null &&
+		printf '%s' "$loid" |
+			dd of="$tmp" bs=1 seek=0 count=24 conv=notrunc 2>/dev/null &&
+		{ [ -z "$password" ] || printf '%s' "$password" |
+			dd of="$tmp" bs=1 seek=24 count=12 conv=notrunc 2>/dev/null; }
+	) && chmod 0600 "$tmp" && mv -f "$tmp" "$IDENTITY_FILE"
+	rc=$?
+	[ "$rc" -eq 0 ] || {
+		rm -f "$tmp" "$IDENTITY_FILE"
+		return 1
+	}
+	size="$(wc -c < "$IDENTITY_FILE" 2>/dev/null)"
+	[ "$size" = 36 ] || {
+		rm -f "$IDENTITY_FILE"
+		return 1
+	}
+	return 0
+}
+
+write_enhanced_psk() {
+	local psk="$1" tmp rc
+
+	if [ -z "$psk" ]; then
+		rm -f "$PSK_FILE"
+		return 0
+	fi
+	[ "${#psk}" -eq 32 ] || return 1
+	case "$psk" in *[!0-9a-fA-F]*) return 1 ;; esac
+	tmp="$(mktemp "${PSK_FILE}.XXXXXX")" || return 1
+	( umask 077; printf '%s' "$psk" > "$tmp" ) &&
+		chmod 0600 "$tmp" && mv -f "$tmp" "$PSK_FILE"
+	rc=$?
+	[ "$rc" -eq 0 ] || rm -f "$tmp" "$PSK_FILE"
+	return "$rc"
+}
+
+
+write_model_marker() {
+	local binding="$1" local_vlans="$2" selected previous tmp rc fingerprint
+
+    # Reuse a provisioned MIB only for the same line and fixed HGU policy. Hash the
+    # NUL-framed tuple so neither this marker nor diagnostic output holds
+    # subscriber credentials. A version tag invalidates older signatures.
+    fingerprint="$(printf '%s\0' "$sn" "$loid" "$pw" "$psk" "$reg_type" | sha256sum)" || return 1
+    fingerprint="${fingerprint%% *}"
+    [ "${#fingerprint}" -eq 64 ] || return 1
+	selected="v4:hgu-veip:$binding:$local_vlans:$fingerprint"
+
+	previous="$(cat "$PROFILE_FILE" 2>/dev/null)"
+	[ -z "$previous" ] || [ "$previous" = "$selected" ] || rm -f /tmp/mib.dump
+	tmp="$(mktemp "${PROFILE_FILE}.XXXXXX")" || return 1
+	( umask 077; printf '%s\n' "$selected" > "$tmp" ) &&
+		chmod 0600 "$tmp" && mv -f "$tmp" "$PROFILE_FILE"
+	rc=$?
+	[ "$rc" -eq 0 ] || rm -f "$tmp"
+	return "$rc"
+}
+
+start_service() {
+	local mode sn loid pw psk reg_type binding effective_binding ifn binding_snapshot local_vlans
+	# Clear the previous boot's OMCI result before starting the consumer.
+	rm -f /var/run/pon.omci_registered /var/run/pon.omci_status
+	config_load xg140g-pon
+	mode="$(get_value mode)"
+	if [ "$mode" = 0 ]; then
+		mode="$(/usr/sbin/pon-mode-store --effective-mode)" || return 1
+	fi
+	# The asynchronous first-boot worker is the management-start owner until
+	# it has completed MAC/PHY activation. START order alone is insufficient.
+	if [ "$(cat /sys/module/xpon_int/parameters/boot_probe_neutral 2>/dev/null)" = Y ] &&
+		[ ! -e /var/run/pon-bootstrap.ready ]; then
+		return 0
+	fi
+	case "$mode" in
+		0) return 0 ;; # Unknown bootstrap has no MAC/management protocol yet.
+		1|6|7) ;;
+		2|3|4|5) logger -t xg140g-omcid "OMCI disabled for EPON/XEPON mode=$mode (OAM path)"; return 0 ;;
+		*) logger -t xg140g-omcid "invalid PON mode=$mode"; return 2 ;;
+	esac
+	modprobe pon_mc_guard || { logger -t xg140g-omcid "cannot load multicast policy backend"; return 1; }
+	sn="$(get_value gpon_sn)"
+	loid="$(get_value loid)"
+	pw="$(get_value password)"
+	psk="$(get_value omci_psk)"
+    reg_type="$(get_value omci_pon_reg_type)"
+    case "$reg_type" in ''|1|2|3|4) ;; *) logger -t xg140g-omcid "invalid PON registration type"; return 1 ;; esac
+	binding="$(get_value wan_binding)"
+	[ -n "$binding" ] || binding=auto
+	case "$binding" in auto|omci|linux-vlan) ;; *)
+		logger -t xg140g-omcid "invalid WAN binding"; return 1 ;;
+	esac
+	binding_snapshot="$(/usr/libexec/xg140g-pon-binding)" || {
+        logger -t xg140g-omcid "cannot resolve configured PON network topology"
+        return 1
+    }
+    effective_binding="$binding"
+    [ "$binding" != auto ] || effective_binding="$(printf '%s\n' "$binding_snapshot" | sed -n '1p')"
+    local_vlans="$(printf '%s\n' "$binding_snapshot" | sed -n '2p')"
+	write_model_marker "$effective_binding" "$local_vlans" || {
+		logger -t xg140g-omcid "cannot prepare OMCI model marker"
+		return 1
+	}
+	write_identity "$loid" "$pw" || {
+		logger -t xg140g-omcid "cannot prepare OMCI subscriber identity"
+		return 1
+	}
+	write_enhanced_psk "$psk" || {
+		logger -t xg140g-omcid "invalid 128-bit omci_psk"
+		return 1
+	}
+	unset loid pw psk
+	ifn=omci
+	ip link show "$ifn" >/dev/null 2>&1 || { logger -t xg140g-omcid "$ifn netdev not present; omcid not started"; return 1; }
+	ip link set "$ifn" up || return 1
+	procd_open_instance
+	# Credential hygiene: the full serial reaches omcid only through the
+	# process environment ($OMCID_SERIAL) — never through argv (visible in
+	# /proc/<pid>/cmdline) and never into syslog.
+	procd_set_param command /usr/sbin/omcid "$ifn"
+	procd_set_param env OMCID_SERIAL="$sn" \
+		OMCID_WAN_BINDING_REQUESTED="$binding" OMCID_WAN_BINDING="$effective_binding" \
+		OMCID_LOCAL_VLANS="$local_vlans" OMCID_PON_REG_TYPE="$reg_type"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param respawn 3600
+	procd_close_instance
+	logger -t xg140g-omcid "omcid started on $ifn for mode=$mode model=hgu-veip wan_binding=$effective_binding (serial redacted)"
+}
+
+stop_service() {
+	# Idempotent stop: procd_kill_instance is non-zero for an instance that
+	# was never started (EPON/XEPON modes never start omcid); a non-zero stop
+	# would cascade into the PON chain teardown and fail it.
+	procd_kill_instance 2>/dev/null || true
+	rm -f /var/run/pon.omci_registered /var/run/pon.omci_status "$IDENTITY_FILE" "$PSK_FILE"
+	/usr/libexec/xg140g-pon-wan-gate down >/dev/null 2>&1 || true
+}

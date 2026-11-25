@@ -1,0 +1,77 @@
+#!/bin/sh /etc/rc.common
+# XG-140G-TF early per-board MAC provisioning for xg140g-pon.
+#
+# A distributable image ships an empty UCI identity by design (no
+# subscriber credentials in the package).  PON start (START=40) and the
+# protocol detector (START=42) both read this UCI value and whichever
+# wins the boot race bypasses the other's provisioning gate, which left
+# the identity page blank after a sysupgrade -n (board finding
+# 2026-08-31).  Run once before the PON consumers (PON init=40, detector=42):
+# keep a valid UCI value untouched, otherwise take the per-board U-Boot
+# env address and, when that is unavailable or invalid, fall back to a
+# random valid locally-administered unicast address.  The env partition
+# is never written; the generated value persists in UCI only, so it
+# stays stable across reboots and unique per board.  LOID/password stay
+# empty by design -- they are per-subscriber credentials.
+
+START=16
+USE_PROCD=0
+
+valid_ethaddr() {
+	local mac first vendor_default_prefix='00:aa:bb:01:23:'
+	case "$1" in
+		[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]) ;;
+		*) return 1 ;;
+	esac
+	mac="$(printf '%s' "$1" | tr 'A-F' 'a-f')" || return 1
+	case "$mac" in
+		00:00:00:00:00:00|ff:ff:ff:ff:ff:ff) return 1 ;;
+		"${vendor_default_prefix}"??) return 1 ;;
+	esac
+	first="${mac%%:*}"
+	[ $((0x$first & 1)) -eq 0 ]
+}
+
+random_mac() {
+	# This image's busybox has neither od nor hexdump, so tr+head is the
+	# portable extractor.  bit1=1 (locally administered), bit0=0 (unicast);
+	# the validator rejects the degenerate all-zero/all-f forms.
+	local i raw first rest
+	for i in 1 2 3 4 5; do
+		raw="$(tr -dc '0-9a-f' < /dev/urandom 2>/dev/null | head -c 12)" || continue
+		[ ${#raw} -eq 12 ] || continue
+		raw="$(printf '%s' "$raw" | sed 's/../&:/g; s/:$//')"
+		first="${raw%%:*}"
+		rest="${raw#*:}"
+		raw="$(printf '%02x' $(( (0x$first & 0xFE) | 0x02 ))):$rest"
+		if valid_ethaddr "$raw"; then
+			printf '%s\n' "$raw"
+			return 0
+		fi
+	done
+	return 1
+}
+
+start() {
+	local cur mac src
+	cur="$(uci -q get xg140g-pon.onu.ethaddr 2>/dev/null)" || cur=""
+	if valid_ethaddr "$cur"; then
+		return 0
+	fi
+	mac="$(/usr/libexec/xg140g-pon-mac --ensure 2>/dev/null)" || mac=""
+	src="env"
+	if ! valid_ethaddr "$mac"; then
+		mac="$(random_mac)" || mac=""
+		src="random"
+	fi
+	if ! valid_ethaddr "$mac"; then
+		logger -t xg140g-identity "no valid PON MAC available; leaving UCI unchanged"
+		return 0
+	fi
+	if ! uci -q set "xg140g-pon.onu.ethaddr=$mac" || ! uci -q commit xg140g-pon; then
+		logger -t xg140g-identity "UCI write failed for PON MAC"
+		return 0
+	fi
+	logger -t xg140g-identity "PON MAC provisioned from $src: $mac"
+	return 0
+}

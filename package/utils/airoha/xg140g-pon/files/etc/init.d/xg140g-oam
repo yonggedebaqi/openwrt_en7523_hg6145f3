@@ -1,0 +1,129 @@
+#!/bin/sh /etc/rc.common
+# epon_oamd: EPON IEEE 802.3ah OAM + CTC extension + LOID authentication daemon.
+#
+# This init script:
+# 1. Reads LOID and password from UCI config
+# 2. Builds the 36-byte credential structure (24B LOID + 12B password)
+# 3. Writes it atomically with umask 077 and chmod 0600
+# 4. Starts the daemon with OUI and vendor info from config
+#
+# Empty identity text can be retained in UCI. Values exceeding the fixed
+# 24+12-byte OAM ABI are rejected before starting the protocol consumer.
+
+START=45
+STOP=65
+
+USE_PROCD=1
+
+CRED_FILE="/tmp/loidXml.txt"
+DAEMON="/usr/sbin/epon_oamd"
+DEFAULT_OUI="00:0d:b6"
+DEFAULT_VENDOR="4d:15:01:00"
+
+config_value() {
+	local name="$1" value
+	config_get value onu "$name"
+	printf '%s\n' "$value"
+}
+
+inject_loid() {
+	local loid pw cred_len tmp rc
+	loid="$(config_value loid)"
+	pw="$(config_value password)"
+    [ "${#loid}" -le 24 ] && [ "${#pw}" -le 12 ] || {
+        logger -t xg140g-oam "LOID credentials exceed the 24/12-byte protocol limits"
+        rm -f "$CRED_FILE"; return 1
+    }
+
+	# Build 36-byte structure: 24B LOID (NUL-padded) + 12B password (NUL-padded)
+	# 审计收敛（P1）：/tmp 世界可写——用 mktemp 创建不可预测的临时名
+	# （防预置 symlink 覆盖任意 root 文件），先 chmod 0600 再原子 rename。
+	tmp="$(mktemp "${CRED_FILE}.XXXXXX")" || {
+		logger -t xg140g-oam "cannot create credential tmp"
+		unset loid pw
+		return 1
+	}
+	(
+		umask 077
+		# BusyBox dd ignores conv=sync padding on short pipe reads
+		# (r1 回归：printf|dd conv=sync 只写出 10B)。预铺 36B 零、
+		# 再用 conv=notrunc 在固定偏移写 LOID/password，等同 r55 实现。
+		dd if=/dev/zero of="$tmp" bs=36 count=1 2>/dev/null &&
+		printf '%s' "$loid" | dd of="$tmp" bs=1 seek=0 count=24 conv=notrunc 2>/dev/null &&
+		{ [ -z "$pw" ] || printf '%s' "$pw" | dd of="$tmp" bs=1 seek=24 count=12 conv=notrunc 2>/dev/null; }
+	) && chmod 0600 "$tmp" && mv -f "$tmp" "$CRED_FILE"
+	rc=$?
+	[ $rc -eq 0 ] || {
+		logger -t xg140g-oam "credential write failed"
+		rm -f "$tmp" "$CRED_FILE"
+		unset loid pw
+		return 1
+	}
+
+	cred_len="$(wc -c < "$CRED_FILE" 2>/dev/null)"
+	[ "$cred_len" = 36 ] || {
+		logger -t xg140g-oam "credential file size=$cred_len (expected 36)"
+		rm -f "$CRED_FILE"
+		unset loid pw
+		return 1
+	}
+
+	unset loid pw
+	return 0
+}
+
+start_service() {
+	local oam_oui oam_vendor mode
+
+	# The OAM daemon owns this marker.  Clear a prior boot/crash result before
+	# validating credentials so every failed start remains unregistered.
+	rm -f /var/run/pon.oam_established
+	config_load xg140g-pon
+	config_get mode onu mode
+	if [ "$mode" = 0 ]; then
+		mode="$(/usr/sbin/pon-mode-store --effective-mode)" || return 1
+	fi
+	# The asynchronous first-boot worker is the management-start owner until
+	# it has completed MAC/PHY activation. START order alone is insufficient.
+	if [ "$(cat /sys/module/xpon_int/parameters/boot_probe_neutral 2>/dev/null)" = Y ] &&
+		[ ! -e /var/run/pon-bootstrap.ready ]; then
+		return 0
+	fi
+	case "$mode" in
+		0) return 0 ;; # Unknown bootstrap has no MAC/management protocol yet.
+		2|3|4|5) ;;
+		1|6|7) rm -f "$CRED_FILE"; return 0 ;;
+		*) logger -t xg140g-oam "invalid PON mode=$mode; OAM not started"; return 2 ;;
+	esac
+	oam_oui="$(config_value oam_oui)"
+	# config 键是 oam_vendor_info（与默认值键一致，审计收敛：此前误读
+	# oam_vendor 导致运营商覆盖静默失效）
+	oam_vendor="$(config_value oam_vendor_info)"
+	[ -n "$oam_oui" ] || oam_oui="$DEFAULT_OUI"
+	[ -n "$oam_vendor" ] || oam_vendor="$DEFAULT_VENDOR"
+
+	inject_loid || return 1
+
+	[ -x "$DAEMON" ] || {
+		logger -t xg140g-oam "daemon binary missing"
+		return 1
+	}
+
+	# Require pon netdev to be UP (QDMA NAPI owner must be active)
+	[ -d /sys/class/net/pon ] || {
+		logger -t xg140g-oam "pon netdev missing; cannot start OAM"
+		return 1
+	}
+
+	procd_open_instance xg140g-oam
+	procd_set_param command "$DAEMON" -O "$oam_oui" -V "$oam_vendor"
+	procd_set_param respawn 5 10 300
+	procd_set_param stderr 1
+	procd_set_param stdout 1
+	procd_close_instance
+}
+
+stop_service() {
+	rm -f "$CRED_FILE"
+	rm -f /var/run/pon.oam_established
+}

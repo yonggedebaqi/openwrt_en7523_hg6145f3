@@ -1,0 +1,138 @@
+#!/bin/sh
+# Reload PON identity without unloading the PON kernel modules or rebooting.
+#
+# The caller identifies why the consumer is being started.  An EPON identity
+# apply rebuilds the OAM session. The daemon renews an active MPCP registration
+# so the OLT authenticates that session again; denied/quiet-backoff states keep
+# their existing timer.
+#
+# EPON/XEPON (2/3/4/5): xg140g-oam re-creates /tmp/loidXml.txt and
+# restarts epon_oamd.
+# GPON/XG-PON/XGS-PON (1/6/7): inject the identity through the existing vendor ioctl,
+# then restart only omcid.  Credentials are passed on stdin and never appear
+# in a command line or log message.
+# The LuCI RPC/calibration caller restarts xg140g-moded after this helper succeeds.
+# Keep that restart out of this shared helper: pon-moded calls it from its own
+# management retry path, and restarting the service here would recurse into the
+# detector that is currently invoking us.
+
+export LC_ALL=C
+
+. /lib/functions.sh
+
+# Legacy management callers do not pass an origin.  That compatibility path
+# is deliberately non-resetting; only explicit luci_identity may touch the
+# PHY FSM.
+origin="${1:-management}"
+case "$origin" in
+	luci_identity|management) ;;
+	*)
+		logger -t xg140g-pon-reload "invalid reload origin"
+		exit 2
+		;;
+esac
+
+config_load xg140g-pon
+config_get mode onu mode
+if [ "$mode" = 0 ]; then
+	mode="$(/usr/sbin/pon-mode-store --effective-mode)" || exit 1
+fi
+# Unknown first boot has no identity consumer yet. The committed identity
+# is consumed by the bootstrap's normal MAC/management startup after RX lock.
+if [ "$mode" = 0 ]; then
+	[ ! -d /sys/module/xpon_10g ] && [ ! -d /sys/module/xpon_gpon ] || exit 1
+	logger -t xg140g-pon-reload "identity saved; protocol unidentified, runtime apply waits for RX detection"
+	exit 0
+fi
+pending=$(uci -q get xg140g-pon.adapt.cold_pending 2>/dev/null || true)
+if [ -n "$pending" ] && [ "$pending" != 0 ]; then
+	pending_boot=$(uci -q get xg140g-pon.adapt.cold_pending_boot 2>/dev/null || true)
+	boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+	if [ -n "$boot" ] && [ "$pending_boot" = "$boot" ]; then
+		logger -t xg140g-pon-reload "cold mode transition pending; runtime reload refused"
+		exit 1
+	fi
+fi
+
+config_get loid onu loid
+config_get password onu ploam_password
+config_get gpon_sn onu gpon_sn
+config_get gpon_regid onu gpon_regid
+config_get ploam_format onu ploam_format ascii
+config_get regid_format onu regid_format ascii
+
+is_epon_mode() {
+	case "$1" in
+		2|3|4|5) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+is_gpon_mode() {
+	case "$1" in
+	1|6|7) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+if is_epon_mode "$mode"; then
+	/etc/init.d/xg140g-oam restart >/dev/null 2>&1 || {
+		logger -t xg140g-pon-reload "xg140g-oam restart failed for mode=$mode"
+		exit 1
+	}
+	exit 0
+fi
+
+if is_gpon_mode "$mode"; then
+	inject=0
+	if [ "$origin" = luci_identity ] || [ -n "$gpon_sn$password$gpon_regid" ]; then
+		inject=1
+		[ -x /usr/sbin/pon-credentials ] && [ -c /dev/pon ] || {
+			logger -t xg140g-pon-reload "PON credential interface unavailable"
+			exit 1
+		}
+		# UCI can hold a draft. Decode with the same helper before stopping
+		# the active link, so invalid input cannot disrupt registration.
+		if ! printf '%s\0%s\0%s\0' "$gpon_sn" "$password" "$gpon_regid" |
+			/usr/sbin/pon-credentials --check "$ploam_format" "$regid_format"; then
+			logger -t xg140g-pon-reload "invalid GPON identity encoding for mode=$mode"
+			exit 1
+		fi
+	fi
+
+	if [ "$origin" = luci_identity ]; then
+		/usr/sbin/pon-moded --stop-link || {
+			logger -t xg140g-pon-reload "GPON stop failed for mode=$mode"
+			exit 1
+		}
+	fi
+
+	if [ "$inject" = 1 ]; then
+		# An explicit empty field clears its ABI bytes. Encoding matches
+		# cold startup, including binary NULs and the full Registration ID.
+		if ! printf '%s\0%s\0%s\0' "$gpon_sn" "$password" "$gpon_regid" |
+			/usr/sbin/pon-credentials /dev/pon "$ploam_format" "$regid_format"; then
+			if [ "$origin" = luci_identity ]; then
+				/usr/sbin/pon-moded --start-link 2>/dev/null || true
+			fi
+			logger -t xg140g-pon-reload "GPON identity ioctl failed for mode=$mode"
+			exit 1
+		fi
+	fi
+
+	if [ "$origin" = luci_identity ]; then
+		/usr/sbin/pon-moded --start-link || {
+			logger -t xg140g-pon-reload "GPON start failed for mode=$mode"
+			exit 1
+		}
+	fi
+
+	/etc/init.d/xg140g-omcid restart >/dev/null 2>&1 || {
+		logger -t xg140g-pon-reload "xg140g-omcid restart failed for mode=$mode origin=$origin"
+		exit 1
+	}
+	exit 0
+fi
+
+logger -t xg140g-pon-reload "unsupported PON mode=$mode; reload refused"
+exit 2

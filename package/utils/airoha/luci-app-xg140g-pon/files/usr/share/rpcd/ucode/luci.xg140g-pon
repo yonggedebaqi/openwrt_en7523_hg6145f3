@@ -1,0 +1,980 @@
+#!/usr/bin/env ucode
+
+'use strict';
+
+import { popen, readfile, stat, unlink } from 'fs';
+import { cursor } from 'uci';
+
+const PON_MODULES = [ 'xpon_int', 'skbmgr', 'qdma_wan', 'en7572', 'xpon_10g', 'xpon_gpon', 'phy_10g' ];
+const NPU_GLUE_READY = '/sys/module/pon_ppe_glue/parameters/npu_ready';
+const EPON_MPCP_STATUS = '/var/run/pon.epon_mpcp';
+const UPLOAD_LEASE = '/usr/libexec/xg140g-pon-upload-lease';
+
+function is_epon_mode(mode) {
+	return mode == 2 || mode == 3 || mode == 4 || mode == 5;
+}
+
+function is_gpon_mode(mode) {
+	return mode == 1 || mode == 6 || mode == 7;
+}
+
+function protocol_name(mode) {
+	switch (mode) {
+	case 1: return 'GPON';
+	case 2: return 'EPON';
+	case 3: return 'XEPON-ASYM';
+	case 4: return 'XEPON-SYM';
+	case 5: return 'XEPON-1G';
+	case 6: return 'XG-PON';
+	case 7: return 'XGS-PON';
+	default: return 'unknown';
+	}
+}
+
+function read_text(path) {
+	try {
+		return readfile(path) || '';
+	} catch (e) {
+		return '';
+	}
+}
+
+function file_exists(path) {
+	try {
+		return stat(path) != null;
+	} catch (e) {
+		return false;
+	}
+}
+
+function marker_field(text, name) {
+	const lines = split(text || '', '\n');
+	const prefix = name + '=';
+	for (let i = 0; i < length(lines); i++)
+		if (index(lines[i], prefix) == 0)
+			return substr(lines[i], length(prefix));
+	return null;
+}
+
+function marker_uint(text, name, maximum) {
+    const value = marker_field(text, name);
+    return value != null && match(value, /^[0-9]+$/) && int(value) <= maximum ? int(value) : null;
+}
+
+function proc_starttime(text) {
+	const close = index(text || '', ') ');
+	if (close < 0)
+		return null;
+	const fields = split(substr(text, close + 2), ' ');
+	/* After the comm field, token 0 is state (field 3); starttime is field 22. */
+	return length(fields) > 19 ? fields[19] : null;
+}
+
+function process_live(pid, expected_start, expected_boot) {
+	let proc, actual_start, boot;
+	if (!pid || !match(pid, /^[0-9]+$/) || !expected_start || !expected_boot)
+		return false;
+	proc = read_text('/proc/' + pid + '/stat');
+	if (match(proc, /\) [ZX] /))
+		return false;
+	actual_start = proc_starttime(proc);
+	boot = trim(read_text('/proc/sys/kernel/random/boot_id'));
+	return actual_start != null && actual_start == expected_start && boot == expected_boot;
+}
+
+function marker_live(path, snapshot) {
+	const text = snapshot ?? read_text(path);
+	const pid = marker_field(text, 'pid');
+	const start = marker_field(text, 'starttime');
+	const boot = marker_field(text, 'boot_id');
+	const heartbeat = marker_field(text, 'heartbeat');
+	let stamp, age;
+
+	if (!heartbeat || !match(heartbeat, /^[0-9]+$/))
+		return false;
+	stamp = int(heartbeat);
+	if (stamp <= 0)
+		return false;
+	age = time() - stamp;
+	return age >= 0 && age <= 15 && process_live(pid, start, boot);
+}
+
+function upload_lease(action, token, kind) {
+	let p = null, args = action + ' ' + token, output = null, rc = -1;
+
+	if (!token || !match(token, /^[A-Za-z0-9._-]+$/) ||
+		(kind != null && !match(kind, /^(bosa|ri)$/)))
+		return null;
+	if (kind != null)
+		args += ' ' + kind;
+	try {
+		p = popen(UPLOAD_LEASE + ' ' + args, 'r');
+		if (!p)
+			return null;
+		output = trim(p.read('all') || '');
+		rc = p.close();
+	} catch (e) {
+		if (p) {
+			try { p.close(); } catch (ignored) {}
+		}
+		return null;
+	}
+	return rc == 0 ? output : null;
+}
+
+function server_upload(kind) {
+	let token = trim(read_text('/proc/sys/kernel/random/uuid'));
+	let path, expected;
+
+	if (!match(kind || '', /^(bosa|ri)$/) ||
+		!match(token || '', /^[A-Fa-f0-9-]{36}$/))
+		return null;
+	path = upload_lease('reserve', token, kind);
+	expected = '/etc/luci-uploads/xg140g-pon-' + token + '-' + kind + '.bin';
+	if (!path || path != expected) {
+		upload_lease('abort', token);
+		return null;
+	}
+	return { token: token, path: path };
+}
+
+function config_lock(action, token) {
+	let p;
+	if (!token || length(token) > 64 || !match(token, /^[A-Za-z0-9._-]+$/))
+		return false;
+	try {
+		p = popen('/usr/libexec/xg140g-pon-config-lock ' + action + ' ' + token, 'r');
+		if (!p)
+			return false;
+		p.read('all');
+		return p.close() == 0;
+	} catch (e) {
+		return false;
+	}
+}
+
+function apply_mac_runtime(mac) {
+	let p = null;
+	try {
+		/* mac is already restricted to six hexadecimal octets by the caller,
+		 * so this command cannot contain shell metacharacters.  The helper is
+		 * root-owned and applies both the live netdev and EPON LLID registers. */
+		p = popen('/usr/libexec/xg140g-pon-apply-mac ' + mac, 'r');
+		if (!p)
+			return false;
+		p.read('all');
+		return p.close() == 0;
+	} catch (e) {
+		if (p) {
+			try { p.close(); } catch (ignored) {}
+		}
+		return false;
+	}
+}
+
+function string_value(value) {
+	return type(value) == 'string' ? value : '';
+}
+
+function credential_valid(value, format, bytes) {
+    if (type(value) != 'string') return false;
+    if (format == 'hex') return length(value) <= 2 * bytes && !match(value, /[^0-9a-fA-F]/);
+    return format == 'ascii' && length(value) <= bytes && !match(value, /[^\x20-\x7e]/);
+}
+
+function config_commit(args) {
+	const token = args && args.token;
+	const values = args && args.values;
+	const uci = cursor();
+	let mode_text = null;
+	let mode = null;
+	const mac = string_value(values && values.ethaddr);
+	const loid = string_value(values && values.loid);
+	const password = string_value(values && values.password);
+	const gpon_sn = string_value(values && values.gpon_sn);
+	const gpon_regid = string_value(values && values.gpon_regid);
+	/* The multicast bit is the low bit of the first octet (the second
+	 * hexadecimal digit), not the high nibble.  Keep globally assigned
+	 * unicast OUIs such as 50:3D:7F valid. */
+	const valid_mac = mac && match(mac, /^[0-9a-f][02468ace](:[0-9a-f]{2}){5}$/i) &&
+		!match(mac, /^(00:){5}00$|^(ff:){5}ff$|^00:aa:bb:01:23:[0-9a-f]{2}$/i);
+	let locked = false;
+	let result = false;
+
+	if (!config_lock('begin', token))
+		return false;
+
+	locked = true;
+	try {
+		/* The protocol is read-only in LuCI. Re-read it only after acquiring
+		 * the shared UCI lock so this transaction cannot overwrite or validate
+		 * against a stale mode changed by another service. */
+		mode_text = uci.get('xg140g-pon', 'onu', 'mode');
+		mode = mode_text && int(mode_text);
+		const valid_values = type(values) == 'object' && type(mode_text) == 'string' &&
+			(mode == 0 || is_epon_mode(mode) || is_gpon_mode(mode));
+		if (valid_values) {
+			const committed = {
+				ethaddr: mac,
+				loid: loid,
+				password: password,
+				gpon_sn: gpon_sn,
+				gpon_regid: gpon_regid,
+				ploam_password: type(values.ploam_password) == 'string' ? values.ploam_password :
+					string_value(uci.get('xg140g-pon', 'onu', 'ploam_password')),
+				ploam_format: values.ploam_format ?? (uci.get('xg140g-pon', 'onu', 'ploam_format') || 'ascii'),
+                regid_format: values.regid_format ?? (uci.get('xg140g-pon', 'onu', 'regid_format') || 'ascii'),
+                credential_schema: '2'
+			};
+            if (!credential_valid(committed.ploam_password,committed.ploam_format,10) ||
+                !credential_valid(committed.gpon_regid,committed.regid_format,36))
+                die('invalid_credential_encoding');
+			const previous = {};
+			for (let key in committed)
+				previous[key] = uci.get('xg140g-pon', 'onu', key) || '';
+			const mac_changed = previous.ethaddr != mac;
+			let ok = true;
+			for (let key in committed) {
+				if (ok && uci.set('xg140g-pon', 'onu', key,
+					committed[key] == null ? '' : committed[key]) === false) {
+					ok = false;
+					break;
+				}
+			}
+			if (ok && uci.commit('xg140g-pon') !== false) {
+				/* Persist first, then apply the live state.  If the runtime
+				 * setter rejects the new address, restore both UCI and the old
+				 * live address before reporting failure.  Invalid or empty
+				 * identity text is still a valid UCI value; only invoke the
+				 * runtime MAC helper for a syntactically safe address. */
+				if (!mac_changed || !valid_mac || apply_mac_runtime(mac)) {
+					result = true;
+				} else {
+					for (let key in previous)
+						uci.set('xg140g-pon', 'onu', key, previous[key]);
+					uci.commit('xg140g-pon');
+					if (previous.ethaddr)
+						apply_mac_runtime(previous.ethaddr);
+					result = false;
+				}
+			} else {
+				/* A failed commit may leave the cursor staged.  Do not leave
+				 * a later caller to inherit a partial identity transaction. */
+				for (let key in previous)
+					uci.set('xg140g-pon', 'onu', key, previous[key]);
+				uci.commit('xg140g-pon');
+			}
+		}
+	} catch (e) {
+		result = false;
+	}
+	if (locked)
+		config_lock('end', token);
+	return result;
+}
+
+/* xg140g-pon-reload is also called from the detector's own start_management()
+ * path, so the restart belongs here (the LuCI caller) rather than in the
+ * shared helper; putting it in the helper would recursively restart the
+ * detector every time it refreshed OAM/OMCI. */
+function restart_adaptive(mode) {
+	let p = null, rc = -1, log = null;
+
+	try {
+		p = popen('/etc/init.d/xg140g-moded restart', 'r');
+		if (p) {
+			p.read('all');
+			rc = p.close();
+		}
+	} catch (e) {
+		rc = -1;
+		if (p) {
+			try { p.close(); } catch (ignored) {}
+		}
+	}
+
+	if (rc == 0)
+		return true;
+
+	/* Keep a direct syslog record even when the init wrapper is missing or
+	 * exits before its own logger call.  mode is read from UCI and is numeric,
+	 * never a user-supplied shell fragment. */
+	try {
+		log = popen('logger -t xg140g-pon-reload "xg140g-moded restart failed for mode=' +
+			mode + '"', 'r');
+		if (log) {
+			log.read('all');
+			log.close();
+		}
+	} catch (ignored) {}
+	return false;
+}
+
+/* Stop the detector before a credential/PHY transaction. */
+function stop_adaptive(mode) {
+	let p = null, rc = -1, log = null;
+
+	try {
+		p = popen('/etc/init.d/xg140g-moded stop', 'r');
+		if (p) {
+			p.read('all');
+			rc = p.close();
+		}
+	} catch (e) {
+		rc = -1;
+		if (p) {
+			try { p.close(); } catch (ignored) {}
+		}
+	}
+
+	if (rc == 0)
+		return true;
+
+	try {
+		log = popen('logger -t xg140g-pon-reload "xg140g-moded stop failed for mode=' +
+			mode + '"', 'r');
+		if (log) {
+			log.read('all');
+			log.close();
+		}
+	} catch (ignored) {}
+	return false;
+}
+
+function stop_management(mode) {
+	let service = is_epon_mode(mode) ? 'xg140g-oam' :
+		(is_gpon_mode(mode) ? 'xg140g-omcid' : null);
+	let p = null, rc = -1;
+
+	if (!service)
+		return false;
+	try {
+		p = popen('/etc/init.d/' + service + ' stop', 'r');
+		if (p) {
+			p.read('all');
+			rc = p.close();
+		}
+	} catch (e) {
+		rc = -1;
+		if (p) {
+			try { p.close(); } catch (ignored) {}
+		}
+	}
+	if (rc == 0)
+		return true;
+	try {
+		p = popen('logger -t xg140g-pon-reload "management stop failed for mode=' +
+			mode + '"', 'r');
+		if (p) {
+			p.read('all');
+			p.close();
+		}
+	} catch (ignored) {}
+	return false;
+}
+
+function stop_identity_consumers(mode) {
+	const management_ok = stop_management(mode);
+	const adaptive_ok = stop_adaptive(mode);
+	try {
+		if (is_epon_mode(mode))
+			unlink('/var/run/pon.oam_established');
+		else if (is_gpon_mode(mode))
+			unlink('/var/run/pon.omci_registered');
+	} catch (ignored) {}
+	return management_ok && adaptive_ok;
+}
+
+function recover_calibration(token) {
+	let p = null, rc = -1;
+
+	if (!token || !match(token, /^[A-Za-z0-9._-]+$/))
+		return false;
+	try {
+		/* A killed Apply helper can leave the UCI mkdir lease behind.  Let the
+		 * durable journal reclaim only its recorded, dead owner before this RPC
+		 * tries to acquire a fresh request lock. */
+		p = popen('/usr/libexec/xg140g-pon-calibration recover ' + token, 'r');
+		if (p) {
+			p.read('all');
+			rc = p.close();
+		}
+	} catch (e) {
+		if (p) {
+			try { p.close(); } catch (ignored) {}
+		}
+	}
+	return rc == 0;
+}
+
+function calibration_pending_status(token) {
+	let p = null, output = null, rc = -1;
+
+	if (!token || !match(token, /^[A-Za-z0-9._-]+$/))
+		return null;
+	try {
+		p = popen('/usr/libexec/xg140g-pon-calibration pending_status ' + token, 'r');
+		if (p) {
+			output = trim(p.read('all') || '');
+			rc = p.close();
+		}
+	} catch (e) {
+		if (p) {
+			try { p.close(); } catch (ignored) {}
+		}
+	}
+	return rc == 0 && match(output || '', /^(none|present|epon)$/) ? output : null;
+}
+
+function calibration_pending_action(token) {
+	let p = null, output = null, rc = -1;
+
+	if (!token || !match(token, /^[A-Za-z0-9._-]+$/))
+		return null;
+	try {
+		p = popen('/usr/libexec/xg140g-pon-calibration pending_action ' + token, 'r');
+		if (p) {
+			output = trim(p.read('all') || '');
+			rc = p.close();
+		}
+	} catch (e) {
+		if (p) {
+			try { p.close(); } catch (ignored) {}
+		}
+	}
+	return rc == 0 && match(output || '', /^(bosa-only|identity|archive-only|invalid)$/) ? output : null;
+}
+
+function helper_action(output) {
+	const result = match(output || '', /^applied (bosa-only|identity|archive-only)$/);
+	return result && result[1] != null ? result[1] : null;
+}
+
+/* Save&apply is two ubus calls because UCI commit and the runtime launcher
+ * have different side effects.  Bind the second call to the exact snapshot
+ * that the first call committed, so another LuCI session cannot be reloaded
+ * accidentally between them.  The comparison is performed while the reload
+ * lock is held and never returns the credential values. */
+function expected_config_matches(uci, expected) {
+	const keys = [ 'ethaddr', 'loid', 'password', 'gpon_sn', 'gpon_regid', 'ploam_password', 'ploam_format', 'regid_format' ];
+
+	if (type(expected) != 'object' || expected == null)
+		return true;
+	for (let i = 0; i < length(keys); i++) {
+		const key = keys[i];
+		const format = key == 'ploam_format' || key == 'regid_format';
+        const value = expected[key] ?? (format ? 'ascii' : null);
+		if (type(value) != 'string' || (uci.get('xg140g-pon', 'onu', key) || (format ? 'ascii' : '')) != value)
+			return false;
+	}
+	return true;
+}
+
+/* The calibration helper reports a machine-readable failure code on stdout
+ * ("error <code>") for its per-token claim rejections; anything else stays a
+ * generic calibration failure. */
+function helper_error(output) {
+	return (type(output) == 'string' && match(output, /^error [A-Za-z0-9_]+$/)) ?
+		substr(output, 6) : null;
+}
+
+function calibration_call(op, token, blob) {
+	if (!token || !match(token, /^[A-Za-z0-9._-]+$/))
+		return { success: false, error: 'invalid_token' };
+	if (op != 'apply' && (type(blob) != 'string' || length(blob) < 4 || length(blob) > 360000))
+		return { success: false, error: 'invalid_upload' };
+	let raw_path = null, lease_active = false;
+	let helper_op = op;
+	if (op != 'apply' && type(blob) == 'string' &&
+		index(blob, '@file:') == 0) {
+		/* The only accepted file reference is the path issued by begin_upload.
+		 * Resolve it through the lease helper instead of stat/unlinking a client
+		 * supplied global marker. */
+		const expected = upload_lease('path', token, op);
+		if (!expected || blob != '@file:' + expected) {
+			/* Leave a malformed request's reservation untouched until the caller
+			 * can take the normal lock-protected abort path.  In particular, do
+			 * not unlink a claimed file from a duplicate request with this token. */
+			return { success: false, error: 'invalid_upload' };
+		}
+		helper_op = op + '_raw';
+	}
+	if (op == 'apply')
+		recover_calibration(token);
+	if (!config_lock('begin', token)) {
+		return { success: false, error: 'config_lock_busy' };
+	}
+	let p = null, rc = -1, error = null, warning = null, mode = null, output = null;
+	let action = null, reported_action = null;
+	try {
+		if (op == 'apply') {
+			action = calibration_pending_action(token);
+			if (!action || action == 'invalid')
+				error = 'invalid_action';
+		}
+		if (error == null && op != 'apply' && index(blob, '@file:') == 0) {
+			raw_path = upload_lease('take', token, op);
+			if (!raw_path || blob != '@file:' + raw_path) {
+				upload_lease('abort', token);
+				raw_path = null;
+			} else {
+				lease_active = true;
+			}
+		}
+		if (error == null) {
+			if (op != 'apply' && index(blob, '@file:') == 0 && !lease_active) {
+				rc = -1;
+				error = 'invalid_upload';
+			} else {
+				p = popen('/usr/libexec/xg140g-pon-calibration ' + helper_op + ' ' + token +
+					(raw_path ? ' ' + raw_path : ''), (op == 'apply' || raw_path) ? 'r' : 'w');
+				if (p) {
+					if (op != 'apply' && !raw_path)
+						p.write(blob);
+					else
+						output = trim(p.read('all') || '');
+					rc = p.close();
+				}
+			}
+		}
+	} catch (e) {
+		rc = -1;
+		if (p) {
+			try { p.close(); } catch (ignored) {}
+		}
+	}
+	if (lease_active) {
+		/* The claim is cleaned by the same transaction owner on both success
+		 * and helper failure.  A public abort is reserved for pre-claim files. */
+		if (upload_lease('finish', token) != null)
+			lease_active = false;
+		else {
+			upload_lease('abort', token);
+			lease_active = false;
+			rc = -1;
+			error = error || 'upload_lease_finish_failed';
+		}
+	}
+	if (op == 'apply' && rc == 0) {
+		reported_action = helper_action(output);
+		if (!reported_action || reported_action != action) {
+			rc = -1;
+			error = 'calibration_action_mismatch';
+		} else if (action == 'identity') {
+		const uci = cursor();
+		const mode_text = uci.get('xg140g-pon', 'onu', 'mode');
+			mode = mode_text ? int(mode_text) : null;
+				if (mode == 0) mode = uci_int(uci, 'adapt', 'scan_mode', 0);
+			if (is_epon_mode(mode) || is_gpon_mode(mode)) {
+				/* The calibration helper owns the identity reload; only refresh the
+				 * adaptive detector after a successful transaction. */
+				const restarted = restart_adaptive(mode);
+				warning = !restarted ? 'adaptive_restart_failed' : null;
+			}
+		}
+	}
+	config_lock('end', token);
+	return {
+		success: rc == 0,
+		error: rc == 0 ? null : (error || helper_error(output) ||
+			(p ? 'calibration_failed' : 'helper_unavailable')),
+		warning: rc == 0 ? warning : null
+	};
+}
+
+function module_loaded(proc_modules, name) {
+	return index('\n' + proc_modules, '\n' + name + ' ') >= 0;
+}
+
+function mpcp_state(debug) {
+	const match_result = match(debug, /(^|\n)mpcpDiscState=([0-9]+)/);
+	return match_result && match_result[2] != null ? int(match_result[2]) : null;
+}
+
+function runtime_state() {
+	const result = {};
+	const text = read_text('/var/run/pon-moded.state');
+	const lines = split(text, '\n');
+	for (let i = 0; i < length(lines); i++) {
+		const line = lines[i];
+		const at = index(line, '=');
+		if (at > 0)
+			result[substr(line, 0, at)] = substr(line, at + 1);
+	}
+	/* The state file is tmpfs runtime evidence, not durable configuration.
+	 * Require the daemon's epoch heartbeat to be recent; otherwise an old
+	 * "registered" snapshot must not survive a crash and look healthy in LuCI. */
+	const stamp = result.updated != null && match(result.updated, /^[0-9]+$/) ?
+		int(result.updated) : null;
+	const age = stamp != null ? time() - stamp : null;
+	result.age = age;
+	result.fresh = age != null && age >= 0 && age <= 15;
+	return result;
+}
+
+function state_int(state, key) {
+	return state[key] != null && match(state[key], /^-?[0-9]+$/) ?
+		int(state[key]) : null;
+}
+
+function uci_int(uci, section, option, fallback) {
+	const value = uci.get('xg140g-pon', section, option);
+	return value != null && match(value, /^-?[0-9]+$/) ? int(value) : fallback;
+}
+
+/* Clear a stale PPPoE Access-Concentrator MAC pin (network.<iface>.ac_mac).
+ * Firmware never sets ac_mac; a preserved value pins discovery to an old BRAS
+ * and drops PADO from the current one. User-initiated, one-shot, reversible. */
+function clear_iface_ac_mac(uci, iface) {
+	if (uci.get('network', iface) == null)
+		return false;
+	if (string_value(uci.get('network', iface, 'ac_mac')) == '')
+		return false;
+	uci.delete('network', iface, 'ac_mac');
+	return true;
+}
+
+function clear_wan_ac_mac() {
+	const uci = cursor();
+	uci.load('network');
+	const cleared = [];
+	if (clear_iface_ac_mac(uci, 'wan'))
+		push(cleared, 'wan');
+	if (clear_iface_ac_mac(uci, 'wan6'))
+		push(cleared, 'wan6');
+	if (length(cleared) == 0)
+		return { success: true, cleared: [] };
+	if (uci.commit('network') === false)
+		return { success: false, error: 'commit_failed' };
+	for (let i = 0; i < length(cleared); i++) {
+		let p = null;
+		try {
+			p = popen('/sbin/ifup ' + cleared[i], 'r');
+			if (p) { p.read('all'); p.close(); }
+		} catch (e) {
+			if (p) { try { p.close(); } catch (ignored) {} }
+		}
+	}
+	return { success: true, cleared: cleared };
+}
+
+const methods = {
+
+	status: {
+		call: function () {
+			const uci = cursor();
+			const mode_text = uci.get('xg140g-pon', 'onu', 'mode');
+			const mode = mode_text ? int(mode_text) : null;
+			const adapt_state = runtime_state();
+			const proc_modules = read_text('/proc/modules');
+			const board_state = read_text('/var/run/pon-board.state');
+			const adaptive_fresh = adapt_state.fresh === true;
+			const daemon_state = adaptive_fresh && process_live(adapt_state.pid,
+				adapt_state.starttime, adapt_state.boot_id);
+			const cold_target = uci_int(uci, 'adapt', 'cold_pending', 0);
+			const cold_pending = is_epon_mode(cold_target) || is_gpon_mode(cold_target);
+			const boot_id = trim(read_text('/proc/sys/kernel/random/boot_id'));
+			const awaiting_reboot = cold_pending && length(boot_id) == 36 &&
+				uci.get('xg140g-pon', 'adapt', 'cold_pending_boot') == boot_id;
+			const adapt_phase = adapt_state.phase || '';
+			const switching = awaiting_reboot || (daemon_state &&
+				(adapt_phase == 'reboot-pending' || adapt_phase == 'reboot-not-observed' ||
+				 adapt_phase == 'reboot-command-failed' || adapt_phase == 'hot-switching' ||
+				 adapt_phase == 'hot-recovery-required'));
+			const running_mode = state_int(adapt_state, 'mode');
+			/* Committing a cold candidate changes UCI before the hardware changes.
+			 * Only a live, current-boot observer identifies the still-running mode.
+			 * An orphan pending journal remains a transition, never target success. */
+			const active_mode = (switching || mode == 0) ? (daemon_state &&
+				(is_epon_mode(running_mode) || is_gpon_mode(running_mode)) ?
+					running_mode : null) : mode;
+			const is_epon = is_epon_mode(active_mode);
+			const daemon_name = active_mode == null ? 'unknown' : (is_epon ? 'epon_oamd' : 'omcid');
+			const oam_marker = marker_live('/var/run/pon.oam_established');
+			const omci_marker = marker_live('/var/run/pon.omci_registered');
+			const omci_text = read_text('/var/run/pon.omci_status');
+			const omci_live = marker_live('/var/run/pon.omci_status', omci_text);
+			/* Status only reads bounded files and proc PID metadata. It does not
+			 * spawn a process or invoke destructive/blocking vendor status nodes. */
+			const glue_ready = file_exists(NPU_GLUE_READY) &&
+				match(trim(read_text(NPU_GLUE_READY)), /^(1|Y|y)$/) != null;
+			/* epon_oamd owns this atomic MPCP heartbeat. The observer is a
+			 * fallback only when its PID, boot identity and heartbeat are live. */
+			const epon_mpcp_text = read_text(EPON_MPCP_STATUS);
+			const epon_mpcp_live = marker_live(EPON_MPCP_STATUS);
+			/* A live MPCP heartbeat proves daemon liveness before authentication.
+			 * The OAM established marker still gates subscriber authentication. */
+			const management_running = is_epon ?
+				(epon_mpcp_live || oam_marker) : (omci_live || omci_marker);
+			const epon_mpcp_value = marker_field(epon_mpcp_text, 'state');
+			const epon_mpcp_state = epon_mpcp_live &&
+				epon_mpcp_value != null && match(epon_mpcp_value, /^[0-9]+$/) ?
+				int(epon_mpcp_value) : null;
+			const epon_silent_value = marker_field(epon_mpcp_text, 'silent_time_left');
+			const epon_silent_time_left = epon_mpcp_live &&
+				epon_silent_value != null && match(epon_silent_value, /^[0-9]+$/) ?
+				int(epon_silent_value) : null;
+			const observed_state = state_int(adapt_state, 'observed');
+			const carrier = trim(read_text('/sys/class/net/pon/carrier'));
+			/* Positive live link evidence is required; absent/failed observations
+			 * cannot turn a stale protocol/authentication marker into success. */
+			const optical_ready = carrier == '1' && (!daemon_state ||
+				state_int(adapt_state, 'los_clear') == 1);
+            const omci_current = !is_epon && !switching && optical_ready && omci_live;
+            const loid_seen = omci_current && marker_uint(omci_text, 'loid_status_seen', 1) == 1;
+            const loid_effective = loid_seen ? marker_uint(omci_text, 'loid_status_effective', 4) : null;
+			const state = is_epon ? (epon_mpcp_state != null ? epon_mpcp_state :
+				(daemon_state && observed_state != null && observed_state >= 0 ?
+					observed_state : null)) : null;
+			const gpon_sn = string_value(uci.get('xg140g-pon', 'onu', 'gpon_sn'));
+			const password = string_value(uci.get('xg140g-pon', 'onu', 'password'));
+			const gpon_regid = string_value(uci.get('xg140g-pon', 'onu', 'gpon_regid'));
+			/* This is an option-readability indicator only.  It deliberately does
+			 * not classify values or require a complete tuple. */
+			const gpon_identity_ready = uci.get('xg140g-pon', 'onu', 'credential_schema') == '2';
+			const ri_file_present = file_exists('/etc/lddla/ri.bin');
+			const modules = {};
+
+			for (let i = 0; i < length(PON_MODULES); i++) {
+				const name = PON_MODULES[i];
+				modules[name] = module_loaded(proc_modules, name);
+			}
+
+			return {
+				board: {
+					model: marker_field(board_state, 'model') || 'unknown',
+					source: marker_field(board_state, 'source') || 'unknown',
+					hardware_profile: marker_field(board_state, 'hardware_profile') || 'unknown'
+				},
+				mode: mode,
+				protocol: protocol_name(mode),
+				active_mode: active_mode,
+				active_protocol: protocol_name(active_mode),
+				switching: switching,
+				modules: modules,
+				pon: {
+					present: file_exists('/sys/class/net/pon'),
+					operstate: trim(read_text('/sys/class/net/pon/operstate')),
+					carrier: carrier,
+					los_clear: daemon_state ? state_int(adapt_state, 'los_clear') : null
+				},
+				registration: {
+					/* Keep link, protocol FSM, and subscriber authentication separate.
+					 * MPCP state 8 alone is not CTC/OAM registration; O5/O9 alone is
+					 * not OMCI MIB completion. */
+					available: !switching && ((is_epon && state != null) ||
+						(!is_epon && daemon_state && adapt_state.registered != null)),
+					known: !switching && ((is_epon && state != null) ||
+						(!is_epon && daemon_state && adapt_state.registered != null)),
+						state: switching ? null : (is_epon ? state :
+							(daemon_state &&
+							adapt_state.registered != null ?
+							(adapt_state.registered == '1' ? 1 : 0) : null)),
+					backoff_seconds: !switching && is_epon ? epon_silent_time_left : null,
+					protocol_ready: !switching && optical_ready && (is_epon ? state == 8 :
+						(daemon_state && adapt_state.observed != null &&
+							(adapt_state.observed == 5 || adapt_state.observed == 9))),
+					/* A completed MIB exchange proves OMCC traffic, not LOID authentication. */
+                    exchange_ready: !switching && optical_ready && !is_epon && omci_marker,
+                    authenticated: is_epon ? (!switching && optical_ready && oam_marker) :
+                        (loid_effective == null || loid_effective == 0 ? null : loid_effective == 1),
+					registered: !switching && optical_ready && (is_epon ?
+						(management_running && state == 8 && oam_marker) :
+						(management_running && daemon_state &&
+						adapt_state.registered == '1' && omci_marker))
+				},
+                omci: {
+                    registration_type: omci_current ? marker_uint(omci_text, 'pon_reg_type', 4) : null,
+                    loid_status: loid_seen ? marker_uint(omci_text, 'loid_status_raw', 4) : null,
+                    loid_effective: loid_effective,
+                    loid_ignored: loid_seen && marker_uint(omci_text, 'loid_status_ignored', 1) == 1,
+                    enhanced_security_state: omci_current ? marker_uint(omci_text, 'enhanced_security_state', 5) : null,
+                    service_rules: omci_current ? marker_uint(omci_text, 'service_rules', 65535) : null,
+                    service_pending: omci_current ? marker_uint(omci_text, 'service_pending', 65535) : null
+                },
+				daemon: {
+					name: daemon_name,
+					running: management_running,
+					status_source: is_epon ? 'mpcp-heartbeat' : 'omci-heartbeat',
+					adaptive_running: daemon_state
+				},
+				adaptive: {
+					enabled: uci.get('xg140g-pon', 'adapt', 'enabled') == '1',
+					auto: uci.get('xg140g-pon', 'adapt', 'auto') == '1',
+					running: daemon_state,
+					process_running: daemon_state,
+					fresh: adaptive_fresh,
+					age: adapt_state.age,
+					phase: adaptive_fresh ?
+						(adapt_state.phase || 'starting') :
+						(!daemon_state ? 'unavailable' : 'stale'),
+					pending: cold_pending,
+					pending_mode: cold_pending ? active_mode : -1,
+					pending_target_mode: cold_pending ? cold_target : -1,
+					pending_count: cold_pending ? uci_int(uci, 'adapt', 'cold_count', 0) : 0,
+					blocked_mode: daemon_state && adapt_state.probe_blocked == '1' ? active_mode : 0,
+					switch_count: uci_int(uci, 'adapt', 'cold_count', 0),
+					switch_budget: 8,
+					cold_fallback: uci.get('xg140g-pon', 'adapt', 'cold_fallback') == '1',
+					boot_probe: uci.get('xg140g-pon', 'adapt', 'boot_probe') == '1',
+					boot_probe_failed: uci.get('xg140g-pon', 'adapt', 'boot_probe_failed') == '1',
+					enable_gpon_switch: uci.get('xg140g-pon', 'adapt', 'enable_gpon_switch') == '1',
+					target: state_int(adapt_state, 'target'),
+					previous_mode: state_int(adapt_state, 'previous_mode'),
+					family: daemon_state && state_int(adapt_state, 'los_clear') == 1 ?
+						(adapt_state.family || null) : null,
+					rx_class: daemon_state ? state_int(adapt_state, 'rx_class') : null,
+					rx_sync_mode: daemon_state ? state_int(adapt_state, 'rx_sync_mode') : null,
+					rx_nominal_kbps: daemon_state && state_int(adapt_state, 'los_clear') == 1 ?
+						state_int(adapt_state, 'rx_nominal_kbps') : null,
+					observed: state_int(adapt_state, 'observed'),
+					evidence_ticks: state_int(adapt_state, 'evidence'),
+					exact: daemon_state && !switching && state_int(adapt_state, 'los_clear') == 1 &&
+						adapt_state.exact == '1',
+					registered: adapt_state.registered == null ? null :
+						adapt_state.registered == '1',
+					switches: state_int(adapt_state, 'switches'),
+					failed_mask: adapt_state.failed_mask || null,
+					credentials: adapt_state.credentials || 'unknown',
+					bosa: adapt_state.bosa || 'unknown',
+					/* ri.bin is an archive; the runtime consumer is the
+					 * parsed UCI tuple injected through pon-credentials. */
+					ri: gpon_identity_ready ? 'ready' :
+						(ri_file_present ? 'imported' : 'missing'),
+					ri_source: ri_file_present ? 'ri.bin' : null,
+					ri_consumer: gpon_identity_ready ? 'uci+pon-credentials' :
+						(ri_file_present ? 'archive-only' : 'none'),
+					rx_power: state_int(adapt_state, 'rx_power'),
+					rx_power_min: state_int(adapt_state, 'rx_power_min'),
+					gpon_switch: adapt_state.gpon_switch == '1',
+					active_mode: active_mode,
+					active_family: active_mode == null ? null : (is_epon ? 'epon' : 'itu')
+					,switching: switching
+				},
+				npu: {
+					driver_bound: file_exists('/sys/bus/platform/devices/1e900000.npu/driver'),
+					glue_loaded: file_exists('/sys/module/pon_ppe_glue'),
+					control_plane_ready: glue_ready &&
+						file_exists('/sys/bus/platform/devices/1e900000.npu/driver')
+				}
+			};
+		}
+	},
+
+	reload: {
+		args: { token: '', expected: {} },
+		call: function (request) {
+			const args = request && request.args;
+			const token = args && args.token;
+			let mode = null;
+			let locked = false;
+			let result = { success: false, protocol: 'unknown', error: 'launcher_exception' };
+
+			if (!config_lock('begin', token))
+				return { success: false, protocol: 'unknown', error: 'config_lock_busy' };
+			locked = true;
+
+			try {
+				const uci = cursor();
+				const mode_text = uci.get('xg140g-pon', 'onu', 'mode');
+				mode = mode_text ? int(mode_text) : null;
+				if (mode == 0) mode = uci_int(uci, 'adapt', 'scan_mode', 0);
+				if (mode != 0 && !is_epon_mode(mode) && !is_gpon_mode(mode)) {
+					result = { success: false, protocol: protocol_name(mode), error: 'unsupported_mode' };
+				} else if (!expected_config_matches(uci, args && args.expected)) {
+					result = { success: false, protocol: protocol_name(mode), error: 'identity_conflict' };
+				} else {
+					let p = popen('/usr/libexec/xg140g-pon-reload luci_identity', 'r');
+					if (!p) {
+						result = { success: false, protocol: protocol_name(mode), error: 'launcher_unavailable' };
+					} else {
+						/* The launcher deliberately emits no stdout; never return credentials. */
+						p.read('all');
+						const rc = p.close();
+						result = {
+							success: rc == 0,
+							protocol: protocol_name(mode),
+							deferred: rc == 0 && mode == 0,
+							error: rc == 0 ? null : 'reload_failed',
+							warning: rc == 0 && !restart_adaptive(mode) ?
+								'adaptive_restart_failed' : null
+						};
+					}
+				}
+			} catch (e) {
+				result = { success: false, protocol: protocol_name(mode), error: 'launcher_exception' };
+			}
+			if (locked)
+				config_lock('end', token);
+			return result;
+		}
+	},
+
+	config_commit: {
+		args: { token: '', values: {} },
+		call: function (request) {
+			return { success: config_commit(request && request.args) };
+		}
+	},
+
+	begin_upload: {
+		args: { kind: '' },
+		call: function (request) {
+			const kind = request && request.args && request.args.kind;
+			const upload = server_upload(kind);
+			return upload ? { success: true, token: upload.token, path: upload.path } :
+				{ success: false, error: 'upload_busy' };
+		}
+	},
+
+	abort_upload: {
+		args: { token: '' },
+		call: function (request) {
+			const token = request && request.args && request.args.token;
+			let locked = false, success = false;
+			/* Abort shares the same UCI transaction lock as Apply/take.  Without
+			 * this gate a browser cancellation could unlink a claimed CGI file
+			 * while the calibration helper is consuming it. */
+			if (config_lock('begin', token)) {
+				locked = true;
+				success = upload_lease('abort', token) != null;
+			}
+			if (locked)
+				config_lock('end', token);
+			return { success: success, error: success ? null : 'upload_busy' };
+		}
+	},
+
+	upload_bosa: {
+		args: { token: '', blob: '' },
+		call: function (request) {
+			const a = request && request.args;
+			return calibration_call('bosa', a && a.token, a && a.blob);
+		}
+	},
+
+	upload_ri: {
+		args: { token: '', blob: '' },
+		call: function (request) {
+			const a = request && request.args;
+			return calibration_call('ri', a && a.token, a && a.blob);
+		}
+	},
+
+	apply_calibration: {
+		args: { token: '' },
+		call: function (request) {
+			const a = request && request.args;
+			return calibration_call('apply', a && a.token, '');
+		}
+	},
+
+	clear_ac_mac: {
+		call: function () {
+			return clear_wan_ac_mac();
+		}
+	}
+
+};
+
+return { 'luci.xg140g-pon': methods };

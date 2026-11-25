@@ -1,0 +1,157 @@
+#!/bin/sh
+# Neutral first boot: no MAC/default until a TX-inhibited RX scan has evidence.
+# One bounded scan per request, with the configuration lock released between
+# requests. Hardware/commit/start failures are terminal, not retry successes.
+set -eu
+
+UCI=/sbin/uci
+STORE=/usr/sbin/pon-mode-store
+LOCK=/usr/libexec/xg140g-pon-config-lock
+PARAM=/sys/module/xpon_int/parameters
+STATE=/var/run/pon-moded.state
+READY=/var/run/pon-bootstrap.ready
+ACTIVATING=/var/run/pon-bootstrap.activating
+token=cold-$$
+owned=0
+lock_changing=0
+stop_requested=0
+phase=waiting-rx
+mode=0
+boot=$(cat /proc/sys/kernel/random/boot_id)
+stat=$(cat /proc/$$/stat)
+stat=${stat##*) }
+set -- $stat
+shift 19
+starttime=$1
+umask 077
+exec 8>/var/run/pon-bootstrap.lock
+flock -n 8 || exit 1
+
+read_bool() {
+	local value
+	value=$("$UCI" -q get "xg140g-pon.adapt.$1" 2>/dev/null || true)
+	[ -n "$value" ] || value=$2
+	case "$value" in
+		1|on|true|yes|enabled) printf '1\n' ;;
+		0|off|false|no|disabled) printf '0\n' ;;
+		*) return 1 ;;
+	esac
+}
+
+publish() {
+	{
+		printf 'pid=%s\nstarttime=%s\nboot_id=%s\nupdated=%s\n' "$$" "$starttime" "$boot" "$(date +%s)"
+		printf 'mode=0\nphase=%s\ntarget=-1\nprevious_mode=-1\nfamily=unknown\n' "$phase"
+		printf 'observed=-1\nevidence=0\nexact=0\nregistered=0\nmanagement_pending=0\n'
+		printf 'rx_class=0\nrx_sync_mode=0\nrx_nominal_kbps=0\nrate_hint=0\nlos_clear=-1\nprobe_blocked=0\n'
+	} > "$STATE.$$"
+	mv "$STATE.$$" "$STATE"
+}
+stop() {
+	stop_requested=1
+	# A helper may have changed the lock before owned reflects its result.
+	# Finish that ownership transition before the EXIT trap releases it.
+	[ "$lock_changing" = 0 ] || return 0
+	trap '' HUP INT TERM
+	phase=bootstrap-stopped
+	publish
+	exit 0
+}
+release() {
+	lock_changing=1
+	"$LOCK" end "$token"
+	owned=0
+	lock_changing=0
+	[ "$stop_requested" = 0 ] || stop
+}
+finish() {
+	rc=$?
+	trap - EXIT
+	trap '' HUP INT TERM
+	if [ "$owned" = 1 ]; then "$LOCK" end "$token" || rc=1; fi
+	if [ "$rc" != 0 ]; then
+		logger -t xg140g-pon "neutral bootstrap failed at $phase (rc=$rc); no fallback or automatic reboot"
+		phase=bootstrap-failed
+		publish
+	fi
+	rm -f "$STATE.$$"
+	exit "$rc"
+}
+trap finish EXIT
+trap stop HUP INT TERM
+
+[ "$(cat "$PARAM/boot_probe_neutral")" = Y ]
+while :; do
+	phase=waiting-config-lock
+	publish
+	lock_changing=1
+	if ! "$LOCK" begin "$token"; then
+		lock_changing=0
+		[ "$stop_requested" = 0 ] || stop
+		sleep 1
+		continue
+	fi
+	owned=1
+	lock_changing=0
+	[ "$stop_requested" = 0 ] || stop
+	"$UCI" -q get xg140g-pon.adapt >/dev/null
+	enabled=$(read_bool enabled 1)
+	automatic=$(read_bool auto 1)
+	if [ "$enabled:$automatic" != 1:1 ]; then
+		phase=bootstrap-cancelled
+		publish
+		release
+		exit 0
+	fi
+	phase=read-config
+	mode=$("$STORE" --effective-mode)
+	if [ "$mode" = 0 ]; then
+		phase=waiting-rx
+		publish
+		[ "$(cat "$PARAM/boot_probe_held")" = Y ]
+		result=$(cat "$PARAM/boot_probe_result")
+		if [ "$result" = 0 ]; then
+			/usr/bin/printf '1\n' > /sys/module/phy_10g/parameters/bootstrap_scan
+			result=$(cat "$PARAM/boot_probe_result")
+		fi
+		if [ "$result" = 0 ]; then
+			release
+			sleep 2
+			continue
+		fi
+		phase=commit-rx-candidate
+		"$STORE" --boot-select 0 "$result"
+		mode=$result
+	fi
+	case "$mode" in 1|2|3|4|6|7) ;; *) exit 1 ;; esac
+	# A restart may observe a committed candidate before MAC activation.
+	# It must match this module lifecycle's attested framing, not just UCI.
+	[ "$(cat "$PARAM/boot_probe_result")" = "$mode" ]
+	[ "$(cat "$PARAM/boot_probe_sync_mode")" = "$mode" ]
+	phase=activate-mac
+	if [ ! -e "$READY" ]; then
+		# Never repeat a partially completed MAC initialization after a kill.
+		# A reboot is required to reset that hardware lifecycle explicitly.
+		[ ! -e "$ACTIVATING" ]
+		[ "$(cat "$PARAM/boot_probe_held")" = Y ]
+		printf '%s\n' "$mode" > "$ACTIVATING"
+		/etc/init.d/xg140g-pon start
+		[ "$(cat "$PARAM/boot_probe_held")" = N ]
+		mv "$ACTIVATING" "$READY"
+	fi
+	[ "$(cat "$READY")" = "$mode" ]
+	[ "$(cat "$PARAM/boot_probe_held")" = N ]
+	phase=start-management
+	case "$mode" in
+		1|6|7) /etc/init.d/xg140g-omcid start ;;
+		2|3|4) /etc/init.d/xg140g-oam start ;;
+	esac
+	printf '%s\n' "$mode" > /var/run/pon-bootstrap.complete
+	release
+	break
+done
+logger -t xg140g-pon "neutral bootstrap activated RX-confirmed candidate mode=$mode; registration observer takes over"
+rm -f "$STATE"
+trap - EXIT HUP INT TERM
+exec 8>&-
+exec /usr/sbin/pon-moded

@@ -1,0 +1,29 @@
+#!/bin/sh
+# Explicit LuCI action only. No hot MAC/PHY switching.
+if [ "${1:-}" = --reboot ]; then
+    sleep 3
+    /sbin/reboot
+    exit $?
+fi
+. /usr/share/libubox/jshn.sh
+answer() { json_init; json_add_boolean success "$1"; json_add_string message "$2"; json_dump; }
+case "${1:-}" in auto|1|2|3|4|5|6|7) ;; *) answer 0 'unsupported_mode'; exit ;; esac
+[ "$(/usr/sbin/pon-mode-store --user-mode-api 2>/dev/null)" = 1 ] || {
+    answer 0 'requires_firmware_1.4.5'; exit;
+}
+command -v setsid >/dev/null 2>&1 || { answer 0 'setsid_unavailable'; exit; }
+boot=$(cat /proc/sys/kernel/random/boot_id)
+token="mode-$$-$boot"
+/usr/libexec/xg140g-pon-config-lock begin "$token" || { answer 0 'configuration_busy_or_reboot_pending'; exit; }
+trap '/usr/libexec/xg140g-pon-config-lock end "$token" >/dev/null 2>&1' EXIT
+trap 'exit 1' HUP INT TERM
+was_enabled=$(uci -q get xg140g-pon.adapt.enabled)
+/etc/init.d/xg140g-moded stop >/dev/null 2>&1
+if ! /usr/sbin/pon-mode-store --user-mode "$1" "$boot"; then
+    [ "$was_enabled" != 1 ] || /etc/init.d/xg140g-moded start >/dev/null 2>&1
+    answer 0 'mode_commit_failed'
+    exit
+fi
+# The committed same-boot pending marker blocks all ordinary PON writers.
+setsid /usr/libexec/xg140g-pon-mode-select --reboot </dev/null >/dev/null 2>&1 &
+answer 1 'reboot_scheduled'

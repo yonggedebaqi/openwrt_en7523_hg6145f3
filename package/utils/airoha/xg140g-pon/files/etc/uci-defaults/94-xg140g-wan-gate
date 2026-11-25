@@ -1,0 +1,26 @@
+#!/bin/sh
+# PON data opens only after its management family has established a bearer:
+# CTC+LLID for EPON, successful OMCI exchange for ITU modes.  Preserve LAN
+# reachability, but prevent netifd from burning DHCP retries before that gate.
+
+set -eu
+
+case "$(board_name 2>/dev/null)" in
+ nokia,xg-140g-tf) ;;
+ nokia,xg-040g-md-ubi) [ -e /sys/firmware/devicetree/base/xg140g,pon-stack ] || exit 0 ;;
+ *) exit 0 ;;
+esac
+
+# pon owns the shared PON RX NAPI/interrupt path, including OAM/OMCI.
+# Keep a separate netifd device reference while DHCP/PPPoE WAN is gated down.
+# proto none runs no address acquisition and adds no WAN route/firewall zone.
+uci -q set network.pon_mgmt=interface
+uci -q set network.pon_mgmt.proto='none'
+uci -q set network.pon_mgmt.device='pon'
+uci -q set network.pon_mgmt.auto='1'
+
+uci -q set network.wan.auto='0'
+uci -q set network.wan6.auto='0'
+uci commit network
+
+exit 0

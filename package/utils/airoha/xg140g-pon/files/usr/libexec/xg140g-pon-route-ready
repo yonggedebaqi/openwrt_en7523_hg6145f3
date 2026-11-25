@@ -1,0 +1,35 @@
+#!/bin/sh
+# R1.4.4: identify the actual logical WAN and its physical ancestry.
+# This is a startup prerequisite, not proof of PPE flow admission or forwarding.
+[ "$#" -eq 0 ] || exit 2
+valid_device() {
+    case "$1" in ''|*[!A-Za-z0-9_.:-]*) return 1 ;; esac
+    [ "${#1}" -le 15 ]
+}
+uses_pon() {
+    local dev="$1" depth="$2" lower child
+    valid_device "$dev" || return 1
+    [ "$depth" -le 8 ] && [ -d "/sys/class/net/$dev" ] || return 1
+    [ "$dev" = pon ] && return 0
+    for lower in /sys/class/net/"$dev"/lower_*; do
+        [ -e "$lower" ] || continue
+        child="${lower##*/lower_}"
+        uses_pon "$child" "$((depth + 1))" && return 0
+    done
+    return 1
+}
+status="$(ubus call network.interface.wan status 2>/dev/null)" || exit 1
+up="$(jsonfilter -s "$status" -e '@.up' 2>/dev/null)" || exit 1
+[ "$up" = true ] || exit 1
+physical="$(jsonfilter -s "$status" -e '@.device' 2>/dev/null)" || exit 1
+l3="$(jsonfilter -s "$status" -e '@.l3_device' 2>/dev/null)"
+[ -n "$l3" ] || l3="$physical"
+valid_device "$l3" && uses_pon "$physical" 0 || exit 1
+[ -d "/sys/class/net/$l3" ] || exit 1
+# Include policy-routing tables and IPv6-only WANs. Never accept another PPP
+# interface merely because its name starts with ppp.
+for family in -4 -6; do
+    ip "$family" route show table all default dev "$l3" 2>/dev/null |
+        grep -q '^default ' && exit 0
+done
+exit 1

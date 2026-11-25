@@ -1,0 +1,104 @@
+#!/bin/sh
+. /usr/share/libubox/jshn.sh
+D=/var/run/xg140g-pon-debug
+umask 077
+reply_error() { json_init; json_add_string error "$1"; json_dump; }
+alive() {
+    [ -r "$D/lock/pid" ] || return 1
+    read -r pid < "$D/lock/pid"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$pid/cmdline" ] &&
+        tr '\000' ' ' < "/proc/$pid/cmdline" | grep -q '/usr/libexec/xg140g-pon-debug-collect'
+}
+case "$1" in
+list) echo '{"start":{},"status":{},"mode_status":{},"mode_set":{"selection":""},"read":{"offset":0,"generation":""}}' ;;
+call)
+    [ ! -L "$D" ] || { reply_error 'unsafe runtime directory'; exit; }
+    mkdir -p "$D" || exit 1
+    case "$2" in
+    mode_status)
+        available=0
+        [ "$(/usr/sbin/pon-mode-store --user-mode-api 2>/dev/null)" != 1 ] || available=1
+        mode=$(uci -q get xg140g-pon.onu.mode)
+        enabled=$(uci -q get xg140g-pon.adapt.enabled)
+        auto=$(uci -q get xg140g-pon.adapt.auto)
+        selection="$mode"
+        [ "$enabled:$auto" != 1:1 ] || selection=auto
+        json_init; json_add_boolean available "$available"
+        json_add_string selection "$selection"; json_add_string configured_mode "$mode"
+        json_add_string phase "$(sed -n 's/^phase=//p' /var/run/pon-moded.state 2>/dev/null)"
+        json_dump
+        ;;
+    mode_set)
+        read -r input
+        json_load "$input" || { reply_error 'Invalid JSON'; exit; }
+        json_get_var selection selection
+        case "$selection" in auto|1|2|3|4|5|6|7) ;; *) reply_error 'Unsupported mode'; exit ;; esac
+        /usr/libexec/xg140g-pon-mode-select "$selection"
+        ;;
+    start)
+        # Serialize stale-lock reclamation as well as new-task publication.
+        exec 9>"$D/start.lock" || { reply_error 'Cannot lock collector'; exit; }
+        flock -n 9 || { reply_error 'Collection is starting; retry shortly'; exit; }
+        if [ -d "$D/lock" ]; then
+            if alive; then reply_error 'Collection already running'; exit; fi
+            # A missing PID may be the small interval between mkdir and fork.
+            now=$(date +%s); stamp=$(cat "$D/lock/created" 2>/dev/null)
+            case "$stamp" in ''|*[!0-9]*) stamp=0 ;; esac
+            [ "$now" -lt "$stamp" ] || [ $((now-stamp)) -ge 10 ] || { reply_error 'Collection is starting; retry shortly'; exit; }
+            rm -rf "$D/lock"
+        fi
+        mkdir "$D/lock" || { reply_error 'Collection already running'; exit; }
+        date +%s > "$D/lock/created"
+        rm -f "$D/report.txt" "$D/report.part"
+        printf "%s-%s\n" "$(date +%s)" "$$" > "$D/generation"
+        echo starting > "$D/state"
+        echo Starting > "$D/stage"
+        setsid /usr/libexec/xg140g-pon-debug-collect 9>&- </dev/null >/dev/null 2>&1 &
+        echo "$!" > "$D/lock/pid"
+        json_init; json_add_boolean started 1; json_dump
+        ;;
+    status)
+        state=$(cat "$D/state" 2>/dev/null); state=${state:-idle}
+        if [ "$state" = running ] || [ "$state" = starting ]; then
+            if ! alive && [ -f "$D/lock/pid" ]; then state=interrupted; fi
+        fi
+        bytes=0
+        [ ! -f "$D/report.txt" ] || bytes=$(wc -c < "$D/report.txt")
+        json_init
+        json_add_string state "$state"
+        json_add_string stage "$(cat "$D/stage" 2>/dev/null)"
+        json_add_int bytes "$bytes"
+        json_add_string version '1.4.5'
+        json_add_string generation "$(cat "$D/generation" 2>/dev/null)"
+        json_dump
+        ;;
+    read)
+        # Hold a shared lock across generation check and file read. Otherwise
+        # start can unlink the old report before publishing its new generation.
+        exec 9>"$D/start.lock" || { reply_error 'Cannot lock report'; exit; }
+        flock -s -n 9 || { reply_error 'Report is changing; retry shortly'; exit; }
+        read -r input
+        json_load "$input" || { reply_error 'Invalid JSON'; exit; }
+        json_get_var generation generation
+        [ -n "$generation" ] && [ "$generation" = "$(cat "$D/generation" 2>/dev/null)" ] || { reply_error 'Report changed; refresh first'; exit; }
+        json_get_var offset offset
+        case "$offset" in ''|*[!0-9]*) reply_error 'Invalid offset'; exit ;; esac
+        [ "${#offset}" -le 7 ] && [ "$offset" -le 524288 ] || { reply_error 'Offset out of range'; exit; }
+        # Decimal conversion avoids treating client-supplied leading zeroes as octal.
+        offset=$(printf '%s' "$offset" | sed 's/^0*//'); offset=${offset:-0}
+        [ -f "$D/report.txt" ] || { reply_error 'Report not ready'; exit; }
+        size=$(wc -c < "$D/report.txt")
+        chunk=$(dd if="$D/report.txt" bs=1 skip="$offset" count=8192 2>/dev/null; printf .)
+        chunk=${chunk%.}
+        [ "$generation" = "$(cat "$D/generation" 2>/dev/null)" ] || { reply_error 'Report changed; refresh first'; exit; }
+        next=$((offset+8192)); [ "$next" -le "$size" ] || next=$size
+        json_init; json_add_string text "$chunk"
+        json_add_int next "$next"; json_add_int size "$size"
+        json_add_boolean done "$([ "$next" -ge "$size" ] && echo 1 || echo 0)"
+        json_dump
+        ;;
+    *) reply_error 'Unknown method' ;;
+    esac
+    ;;
+esac

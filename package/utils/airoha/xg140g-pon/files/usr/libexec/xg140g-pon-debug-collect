@@ -1,0 +1,276 @@
+#!/bin/sh
+# No network/config writes. Fixed paths and commands; no user-supplied shell.
+umask 077
+export LC_ALL=C
+D=/var/run/xg140g-pon-debug
+[ -d "$D/lock" ] && [ ! -L "$D" ] || exit 1
+REPORT="$D/report.part"
+: > "$REPORT"
+echo running > "$D/state"
+finish() {
+    rm -f "$D/raw"
+    echo interrupted > "$D/state"
+    rm -rf "$D/lock"
+}
+trap finish EXIT
+trap 'exit 1' HUP INT TERM
+sanitize() {
+    # Mask values, not lines: authentication results, field names, errors and
+    # adjacent protocol evidence remain available. Use target BusyBox awk.
+    tr -cd '\11\12\15\40-\176' | awk '
+    function sensitive(key) {
+        key = tolower(key)
+        gsub(/[ \t]+/, "_", key)
+        if (key == "private.key") return 1
+        sub(/^.*\./, "", key)
+        return key ~ /(^|_)(loid|password|passwd|passphrase|secret|username|user|serial|serialnumber|sn|regid|registration_id|registration_code|access_token|refresh_token|token|cookie|authorization|psk|private_key)(_|$)/
+    }
+    function metadata(key, value) {
+        return (tolower(key) == "enhanced_security_psk" ||
+            tolower(key) ~ /(^|_)(status|state|result|raw|effective|ignored|seen|count|ms|length|len|octets|configured|present|loaded|valid|errors|failures)$/) &&
+            value ~ /^(null|true|false|[0-9]+)$/
+    }
+    # end_value is the first byte after the value. Carry an open quote across
+    # physical lines (UCI strings), so a multiline value stays masked throughout.
+    function mask_value(text, pos, whole,    first,i,c,q,escaped) {
+        first = substr(text, pos, 1)
+        if (first == "\"" || first == sprintf("%c", 39)) {
+            q = first
+            for (i = pos + 1; i <= length(text); i++) {
+                c = substr(text, i, 1)
+                if (escaped) { escaped = 0; continue }
+                if (c == "\\") { escaped = 1; continue }
+                if (c == q) {
+                    # UCI may concatenate quoted/unquoted shell fragments.
+                    if (substr(text, i + 1, 1) == "\\" &&
+                        substr(text, i + 2, 1) == q && substr(text, i + 3, 1) == q) { i += 3; continue }
+                    end_value = i + 1
+                    return q "***" q
+                }
+            }
+            pending_quote = q
+            end_value = length(text) + 1
+            return q "***"
+        }
+        if (first == "<") {
+            i = index(substr(text, pos + 1), ">")
+            end_value = i ? pos + i + 1 : length(text) + 1
+            return i ? "<***>" : "<***"
+        }
+        if (whole) {
+            end_value = length(text) + 1
+            return "***"
+        }
+        i = pos
+        while (i <= length(text) && substr(text, i, 1) !~ /[ \t,;}&]/ && substr(text, i, 1) != "]") i++
+        end_value = i
+        return i == pos ? "" : "***"
+    }
+    {
+        text = $0; output = ""; pos = 1
+        # pppd prints CHAP challenge/response bytes in an unlabeled <hex> field.
+        if (tolower(text) ~ /chap[ \t]+(challenge|response)/)
+            gsub(/<[^>]*>/, "<***>", text)
+        if (pending_quote != "") {
+            q = pending_quote; pending_quote = ""
+            masked = mask_value(q text, 1, 0)
+            output = substr(masked, 2); pos = end_value - 1
+            if (pending_quote != "") { print output; next }
+        }
+        while (match(tolower(substr(text, pos)), /remote[ \t]+message|authenticate[ \t]+ok|serial[ \t]+number|registration[ \t]+id|loid[ \t]+(code|password)|[a-z_][a-z0-9_.-]*/)) {
+            start = pos + RSTART - 1; finish = start + RLENGTH
+            key = substr(text, start, RLENGTH)
+            output = output substr(text, pos, start - pos)
+            value = finish
+            quoted_key = substr(text, value, 1) == "\""
+            if (quoted_key) value++
+            while (substr(text, value, 1) ~ /[ \t]/ && value <= length(text)) value++
+            separator = substr(text, value, 1)
+            assigned = separator == "=" || separator == ":"
+            if (assigned) {
+                value++
+                while (substr(text, value, 1) ~ /[ \t]/ && value <= length(text)) value++
+            }
+            lower = tolower(key)
+            whole = lower == "remote message" || lower == "authenticate ok" ||
+                (!quoted_key && separator == ":" && (lower == "authorization" || lower == "cookie"))
+            private = sensitive(key) || whole ||
+                (tolower(text) ~ /(^|[^a-z])(pap|chap)([ \t]|$)/ && lower ~ /^(name|challenge|response|pass)$/)
+            # A bare word in prose (e.g. LOID authentication failed) is not a
+            # credential assignment. PAP/CHAP and UCI also use quoted values.
+            bare = !assigned && value > finish && (substr(text, value, 1) == "\"" ||
+                substr(text, value, 1) == sprintf("%c", 39) || substr(text, value, 1) == "<" ||
+                lower == "username" || lower == "user" ||
+                (lower ~ /^(sn|serial|loid)$/ && substr(text, value) ~ /^[A-Za-z0-9:-]*[0-9][A-Za-z0-9:-]*/))
+            if (private && (assigned || bare) && value <= length(text)) {
+                # Numeric PPE cookies are flow IDs, not session credentials.
+                flow = lower == "cookie" && substr(text, 1, start - 1) ~ /airoha_ppe: FT replace $/ &&
+                    substr(text, value) ~ /^[0-9]+ err=-[0-9]+ stage=/
+                if (!flow) {
+                    masked = mask_value(text, value, whole)
+                    raw = substr(text, value, end_value - value)
+                    if (metadata(key, raw)) masked = raw
+                    output = output substr(text, start, value - start) masked
+                    pos = end_value
+                    continue
+                }
+            }
+            output = output key; pos = finish
+        }
+        print output substr(text, pos)
+    }
+    '
+}
+run() {
+    title=$1; shift
+    printf '%s\n' "$title" > "$D/stage.new"; mv "$D/stage.new" "$D/stage"
+    budget=$((500000-$(wc -c < "$REPORT")))
+    if [ "$budget" -lt 1024 ]; then
+        echo "SKIPPED: $title (report budget exhausted)" >> "$REPORT"
+        return 0
+    fi
+    cap=24576
+    raw_limit=128
+    case "$title" in
+        PON_startup_events|PPPoE_events)
+            # Keep protocol evidence in its own larger budget.  The generic
+            # 24 KiB cap previously let unrelated service chatter hide it.
+            cap=65536
+            raw_limit=256
+            ;;
+    esac
+    [ "$budget" -ge "$cap" ] || cap=$((budget-512))
+    printf '\n===== %s =====\n' "$title" >> "$REPORT"
+    if ! command -v "$1" >/dev/null 2>&1; then echo "UNAVAILABLE: $1" >> "$REPORT"; return; fi
+    # File and time budgets protect /tmp against large or stuck proc outputs.
+    (ulimit -f "$raw_limit"; timeout 8 "$@") > "$D/raw" 2>&1
+    rc=$?
+    head -c "$cap" "$D/raw" | sanitize >> "$REPORT"
+    [ "$(wc -c < "$D/raw")" -le "$cap" ] || echo "TRUNCATED: section output exceeded $cap bytes" >> "$REPORT"
+    printf '\n[exit=%s; per-section output limit=%s bytes]\n' "$rc" "$cap" >> "$REPORT"
+}
+readnode() {
+    if [ -r "$1" ]; then run "$1" cat "$1"
+    else printf '\nUNAVAILABLE: %s\n' "$1" >> "$REPORT"; fi
+}
+physical_port_names() {
+    for d in /sys/class/net/*; do
+        [ -d "$d" ] || continue
+        [ -r "$d/type" ] || continue
+        [ "$(cat "$d/type" 2>/dev/null)" = 1 ] || continue
+        [ -L "$d/device" ] || [ -L "$d/phydev" ] || continue
+        printf '%s\n' "${d##*/}"
+    done
+}
+printf 'PON DEBUG 1.5.3\nRead-only collection. IP/MAC/traffic endpoints may be present.\nCredential values are masked as ***; field names and authentication results are retained.\nNo RI/BOSA contents, flash images or memory dumps requested.\nBND and conntrack tags are evidence, not proof of complete hardware forwarding.\nITU modes: 1=GPON (native G.984 MAC), 6=XG-PON, 7=XGS-PON.\nLOS proc encoding: 0=optical loss, 1=no loss. Optical raw power is not dBm.\nMissing data is UNAVAILABLE; timeouts/truncation are explicit, never interpreted as healthy.\n' >> "$REPORT"
+command -v timeout >/dev/null 2>&1 || { echo 'timeout utility unavailable' >> "$REPORT"; exit 1; }
+run Time date
+run Kernel uname -a
+readnode /etc/openwrt_release
+run Board ubus call system board
+readnode /etc/xg140g-pon.buildinfo
+readnode /proc/uptime
+run Packages sh -c 'apk info -v 2>/dev/null | grep -E "^(luci-app-.*pon|xg140g|ppp|kmod-(ppp|nft|nf-|sched)|firewall4|rpcd|nftables|busybox)"'
+critical_snapshot() {
+    run "Control_time_$1" sh -c 'date; cat /proc/uptime'
+    run "PON_scalar_$1" /usr/sbin/pon-debug-state
+    run "PON_status_$1" ubus call luci.xg140g-pon status
+    for n in /var/run/pon-moded.state /proc/pon_phy/los_status /proc/pon_phy/rx_sync_mode /var/run/pon.omci_status /var/run/pon.omci_registered /var/run/pon.epon_mpcp /var/run/pon.oam_established /sys/kernel/debug/ppe/pon_admission; do readnode "$n"; done
+    run "Services_$1" /usr/libexec/xg140g-pon-debug-info services
+    run "WAN_$1" sh -c 'for i in wan wan6 wan_6 pon_mgmt; do echo "--- $i ---"; ubus -t 2 call network.interface.$i status; done'
+    readnode /proc/net/dev
+    readnode /proc/xpon_service
+    readnode /proc/xpon_native_status
+    readnode /proc/net/pppoe
+    readnode /proc/net/vlan/config
+    readnode /proc/xpon_int_status
+}
+critical_snapshot A
+run Identity_presence /usr/libexec/xg140g-pon-debug-info identity
+run Network_config /usr/libexec/xg140g-pon-debug-info network
+run Firewall_config /usr/libexec/xg140g-pon-debug-info firewall
+run Resolver_routes /usr/libexec/xg140g-pon-debug-info resolver
+run PON_startup_events sh -c 'logread | grep -Ei "omcid|xg140g-omcid|procd|ploam|gpon|xpon|pon-moded|netifd|udhcpc|odhcp6c|epon_oamd|xg140g-oam|mpcp" | grep -Eiv "dnsmasq|odhcpd" | tail -n 320'
+run PPPoE_events sh -c 'logread | grep -Ei "pppoe|pppd|ppp|flow offload|hw_offload|offload" | grep -Eiv "dnsmasq|odhcpd" | tail -n 320'
+
+run Interface_delegation ubus call network.interface dump
+run Netifd_device_metadata /usr/libexec/xg140g-pon-debug-info topology
+run LAN_physical_ports /usr/libexec/xg140g-pon-debug-info lan-ports
+run LEDs /usr/libexec/xg140g-pon-debug-info leds
+for dev in $(physical_port_names); do
+    run "LAN_${dev}_driver" ethtool -i "$dev"
+    run "LAN_${dev}_features" ethtool -k "$dev"
+    run "LAN_${dev}_pause" sh -c '
+        dev=$1
+        ethtool -a "$dev" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || printf "status=UNAVAILABLE reason=ethtool_pause_exit_%s\\n" "$rc"
+        exit "$rc"
+    ' sh "$dev"
+    run "LAN_${dev}_EEE" sh -c '
+        dev=$1
+        ethtool --show-eee "$dev" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || printf "status=UNAVAILABLE reason=ethtool_eee_exit_%s\\n" "$rc"
+        exit "$rc"
+    ' sh "$dev"
+done
+run CPU_queue_placement /usr/libexec/xg140g-pon-debug-info placement
+run IPv4_routes ip -4 route show table all
+run IPv6_routes ip -6 route show table all
+run IPv4_rules ip -4 rule show
+run IPv6_rules ip -6 rule show
+run Lower_devices sh -c 'for d in /sys/class/net/*; do echo "--- ${d##*/} ---"; ls -d "$d"/lower_* "$d"/upper_* 2>/dev/null; done'
+run Offload_settings sh -c 'for k in flow_offloading flow_offloading_hw; do printf "%s=" "$k"; uci -q get "firewall.@defaults[0].$k"; done; uci -q show sqm | grep -E "\.(enabled|interface|download|upload|qdisc|script)="'
+run PON_adaptation sh -c 'uci -q show xg140g-pon.adapt; for k in mode onu_type trans_index; do printf "%s=" "$k"; uci -q get xg140g-pon.onu.$k; done'
+run PON_management_status ubus call luci.xg140g-pon status
+run Hardware_model sh -c 'uci -q get xg140g-pon.hardware.model; cat /tmp/sysinfo/model /tmp/sysinfo/board_name 2>/dev/null'
+run Flowtable nft list flowtable inet fw4 ft
+run Forward_chain nft list chain inet fw4 forward
+run NAT_chain nft list chain inet fw4 srcnat
+run WAN_firewall_counters sh -c 'for c in forward_wan forward_lan accept_to_wan srcnat_wan output input; do echo "--- $c ---"; nft list chain inet fw4 "$c"; done'
+run Modules lsmod
+run NPU_driver sh -c 'ls -l /sys/bus/platform/devices/1e900000.npu/driver; for p in /sys/module/pon_ppe_glue/parameters/npu_ready /sys/module/xpon_10g/parameters/mode /sys/module/xpon_10g/parameters/hot_* /sys/module/xpon_int/parameters/boot_probe*; do [ ! -r "$p" ] || { echo "--- $p ---"; cat "$p"; }; done'
+readnode /etc/airoha-en7581-npu-firmware.manifest
+run Firmware_hashes sh -c 'sha256sum /lib/firmware/airoha/en7581_npu_rv32.bin /lib/firmware/airoha/en7581_npu_data.bin'
+readnode /proc/xpon_int_status
+readnode /proc/mtd
+run Filesystems df -h
+snapshot() {
+    run "Timestamp_$1" sh -c 'date; cat /proc/uptime'
+    for dev in $(physical_port_names); do
+        run "LAN_${dev}_link_$1" ethtool "$dev"
+        run "LAN_${dev}_counters_$1" ethtool -S "$dev"
+    done
+    run "Links_$1" /usr/libexec/xg140g-pon-debug-info links
+    for n in /proc/stat /proc/softirqs /proc/interrupts /proc/net/dev /proc/net/softnet_stat /proc/net/snmp /proc/net/netstat /proc/net/snmp6 /proc/meminfo /proc/loadavg /var/run/pon-moded.state /proc/pon_phy/los_status /proc/pon_phy/rx_sync_mode /proc/epon/debug /proc/xgpon/state; do readnode "$n"; done
+    run Conntrack_summary sh -c 'awk '\''{ total++; for(i=1;i<=NF;i++) if($i ~ /^bytes=/) { v=$i; sub(/^bytes=/,"",v); bytes+=v } } /\[OFFLOAD\]/ { sw++ } /\[HW_OFFLOAD\]/ { hw++ } END { printf "total=%d software_tag=%d hardware_tag=%d total_conntrack_bytes=%.0f\n",total,sw,hw,bytes }'\'' /proc/net/nf_conntrack'
+    run Offloaded_flows sh -c 'grep -E "\[(HW_)?OFFLOAD\]" /proc/net/nf_conntrack | head -n 80'
+    readnode /sys/kernel/debug/ppe/bind
+    run "CPU_frequency_$1" /usr/libexec/xg140g-pon-debug-info frequency
+}
+snapshot A
+echo 'Observing registration, OMCI and WAN for 20 seconds; keep the failing setup unchanged; for slow speed keep the test running' > "$D/stage"
+sleep 10
+critical_snapshot B
+sleep 10
+critical_snapshot C
+snapshot B
+run Qdiscs tc -s qdisc show
+for d in /sys/class/net/*; do
+    [ -d "$d" ] || continue
+    dev=${d##*/}
+    run "Classes_$dev" tc -s class show dev "$dev"
+    for hook in root ingress egress; do
+        run "Filters_${dev}_$hook" tc -s filter show dev "$dev" "$hook"
+    done
+done
+run Kernel_events sh -c 'dmesg | grep -Ei "airoha|en8811|md32|phylink|link is|ppe|npu|qdma|pon|mpcp|watchdog|oops|call trace|callbacks suppressed|out of memory" | tail -n 350'
+run Service_events sh -c 'logread | grep -Ei "airoha|ppe|npu|hw-offload|flow offload|flowtable|pon_ppe_glue|qdma" | tail -n 220'
+printf '\n===== Register coverage =====\nPPE bind includes driver-exported hardware table fields. PON boot RX logs include PCS/SFP samples when available.\nNo arbitrary MMIO/devmem access, IRQ-status reads, direct register writes or counter resets.\n===== END =====\n' >> "$REPORT"
+mv "$REPORT" "$D/report.txt"
+echo Complete > "$D/stage"
+echo complete > "$D/state"
+rm -f "$D/raw"
+rm -rf "$D/lock"
+trap - EXIT

@@ -1,0 +1,13 @@
+{
+	"admin/network/pon": {
+		"title": "PON 管理",
+		"order": 85,
+		"action": {
+			"type": "view",
+			"path": "network/pon"
+		},
+		"depends": {
+			"acl": [ "luci-app-xg140g-pon" ]
+		}
+	}
+}

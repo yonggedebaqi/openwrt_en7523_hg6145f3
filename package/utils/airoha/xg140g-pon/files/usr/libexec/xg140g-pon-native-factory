@@ -1,0 +1,24 @@
+#!/bin/sh
+# Read a bounded, named factory volume on the OpenWrt BL2/FIP layout.
+# Output is raw local backup data; no UBI/config/hardware writes are made.
+[ "$#" -eq 1 ] || exit 2
+case "$1" in bosa|ri) name="$1" ;; *) exit 2 ;; esac
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = nokia,xg-040g-md-ubi ] || exit 1
+[ -e /sys/firmware/devicetree/base/xg140g,pon-stack ] || exit 1
+found=
+for volume in /sys/class/ubi/ubi[0-9]*_[0-9]*; do
+	[ -d "$volume" ] || continue
+	[ "$(cat "$volume/name" 2>/dev/null)" = "$name" ] || continue
+	id="${volume##*/}"; parent="${id%_*}"
+	mtd="$(cat "/sys/class/ubi/$parent/mtd_num" 2>/dev/null)"
+	case "$mtd" in ''|*[!0-9]*) continue ;; esac
+	[ "$(cat "/sys/class/mtd/mtd$mtd/name" 2>/dev/null)" = ubi ] || continue
+	[ "$(cat "/sys/class/mtd/mtd$mtd/size" 2>/dev/null)" = 268304384 ] || continue
+	bytes="$(cat "$volume/data_bytes" 2>/dev/null)"
+	case "$bytes" in ''|*[!0-9]*) continue ;; esac
+	[ "$bytes" -ge 262144 ] && [ "$bytes" -le 524288 ] || continue
+	[ -z "$found" ] || exit 1
+	found="/dev/$id"
+done
+[ -n "$found" ] && [ -c "$found" ] || exit 1
+exec dd if="$found" bs=4096 count=64 2>/dev/null

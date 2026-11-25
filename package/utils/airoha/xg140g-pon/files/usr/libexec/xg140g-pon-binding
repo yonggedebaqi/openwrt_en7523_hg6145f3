@@ -1,0 +1,8 @@
+#!/usr/bin/ucode
+'use strict';
+import { cursor } from 'uci';
+import { bindings } from 'pon.topology';
+let u=cursor('/etc/config','/var/run/pon-topology-private');
+if (!u.load('network')) exit(1);
+let result=bindings(u.get_all('network'));
+print(length(result.vlans) ? 'linux-vlan\n' : 'omci\n',join(',',result.vlans),'\n');

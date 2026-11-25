@@ -1,0 +1,826 @@
+#!/bin/sh
+# BOSA/RI calibration transaction helper.
+#
+# Uploads are staged below /etc/lddla/.xg140g-pon-pending/<token> and never
+# replace a live file; the token spans the whole stage/apply transaction so a
+# concurrent upload can never be consumed by another session's apply.  Stage
+# validates everything inside a private staging directory and only then
+# renames it into pending/<token>.  Apply claims the token directory with an
+# atomic rename into .xg140g-pon-applying, consumes only that directory, and
+# returns it to pending/ on any failure.  A SIGKILL or power loss therefore
+# leaves a journal for the next invocation to recover; TERM/HUP/INT exit
+# immediately and deliberately leave that journal.
+
+set -eu
+umask 077
+
+BOSA=/etc/lddla/bob.conf
+RI=/etc/lddla/ri.bin
+PENDING_DIR=/etc/lddla/.xg140g-pon-pending
+APPLYING_DIR=/etc/lddla/.xg140g-pon-applying
+RECOVERY_DIR=/etc/lddla/.xg140g-pon-recovery
+JOURNAL=$RECOVERY_DIR/journal
+REC_BOSA=$RECOVERY_DIR/bob.conf
+REC_RI=$RECOVERY_DIR/ri.bin
+REC_ID=$RECOVERY_DIR/identity.keys
+LOCK=/usr/libexec/xg140g-pon-config-lock
+
+TOKEN=${2:-calibration-$$}
+owned=0
+TMP_ROOT=
+TMP=
+STAGE_DIR=
+CLAIMED_DIR=
+SNAP_BOSA_PRESENT=0
+SNAP_RI_PRESENT=0
+INTERRUPTED=0
+RECOVERY_TOKEN=
+APPLY_ACTION=
+RUNTIME_ERROR=
+
+release_lock() {
+	[ "$owned" -eq 1 ] && "$LOCK" end "$TOKEN" || true
+}
+
+cleanup() {
+	local rc=$?
+	# An uncompleted apply claim returns to pending/ so the same token can be
+	# retried; a failed stage never leaves a half-populated staging directory.
+	# Both mutations touch pending/, so they run while the config lock is
+	# still held: releasing the lock first would let a concurrent same-token
+	# stage publish pending/T between release and the claim return, and the
+	# return would then nest the directory inside it (audit F-4).
+	if [ -n "$CLAIMED_DIR" ] && [ -d "$CLAIMED_DIR" ]; then
+		mv -- "$CLAIMED_DIR" "$PENDING_DIR/$TOKEN" 2>/dev/null || true
+	fi
+	[ -z "$STAGE_DIR" ] || rm -rf -- "$STAGE_DIR"
+	[ -z "${TMP_ROOT:-}" ] || rm -rf -- "${TMP_ROOT}"
+	release_lock
+	# Recovery files are intentionally not cleaned here.  They are the durable
+	# evidence used after SIGKILL/power loss.
+	return "$rc"
+}
+
+on_signal() {
+	INTERRUPTED=1
+	# Do not run a cleanup-and-continue trap for a transaction signal.  EXIT
+	# removes only private scratch data; the journal remains recoverable.
+	exit 143
+}
+
+trap cleanup EXIT
+trap 'on_signal' HUP INT TERM
+
+die() {
+	logger -t xg140g-pon-calibration "$1" 2>/dev/null || true
+	printf 'error %s\n' "${2:-calibration_failed}"
+	exit 1
+}
+
+# Machine-readable failure for the apply claim path: the RPC layer forwards
+# "error <code>" from stdout so the UI can show a specific message.
+fail() {
+	logger -t xg140g-pon-calibration "$1" 2>/dev/null || true
+	printf 'error %s\n' "$2"
+	exit 1
+}
+
+init_tmp() {
+	[ -n "$TMP_ROOT" ] || TMP_ROOT="$(mktemp -d /tmp/xg140g-pon-calibration.XXXXXX)" || die "temporary directory unavailable" 'calibration_tmp_failed'
+	TMP="$TMP_ROOT/work"
+}
+
+bump_lock() {
+	if "$LOCK" check "$TOKEN" 2>/dev/null; then
+		owned=0
+	elif "$LOCK" begin "$TOKEN" 2>/dev/null; then
+		owned=1
+	else
+		die "configuration busy" 'config_lock_busy'
+	fi
+}
+
+ensure_pending_dirs() {
+	mkdir -p "$PENDING_DIR" "$APPLYING_DIR" "$RECOVERY_DIR" || return 1
+	chmod 0700 "$PENDING_DIR" "$APPLYING_DIR" "$RECOVERY_DIR" || return 1
+}
+
+# Stale token directories from abandoned uploads are only ever removed here,
+# as a side effect of staging, after 24 hours.  Flat files at the directory
+# root are pre-1.3.5 upgrade residue the per-token model never reads; drop
+# them here too instead of stranding old identity material on disk (audit F-2).
+sweep_stale_pending() {
+	find "$PENDING_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +0 \
+		-exec rm -rf -- {} + 2>/dev/null || true
+	rm -f -- "$PENDING_DIR/bob.conf" "$PENDING_DIR/ri.bin" \
+		"$PENDING_DIR/identity.keys" 2>/dev/null || true
+}
+
+atomic_copy() {
+	local src="$1" dst="$2" mode="$3" tmp="$2.$$"
+	rm -f -- "$tmp"
+	cp -p -- "$src" "$tmp" || return 1
+	chmod "$mode" "$tmp" || return 1
+	sync
+	mv -f -- "$tmp" "$dst" || return 1
+	sync
+}
+
+atomic_write_identity() {
+	local tmp="$REC_ID.$$"
+	rm -f -- "$tmp"
+	{
+	printf 'ethaddr=%s\n' "$(uci -q get xg140g-pon.onu.ethaddr 2>/dev/null || true)"
+	printf 'loid=%s\n' "$(uci -q get xg140g-pon.onu.loid 2>/dev/null || true)"
+	printf 'password=%s\n' "$(uci -q get xg140g-pon.onu.password 2>/dev/null || true)"
+	printf 'gpon_sn=%s\n' "$(uci -q get xg140g-pon.onu.gpon_sn 2>/dev/null || true)"
+	printf 'credential_schema=%s\n' "$(uci -q get xg140g-pon.onu.credential_schema 2>/dev/null || true)"
+	printf 'ploam_password=%s\n' "$(uci -q get xg140g-pon.onu.ploam_password 2>/dev/null || true)"
+	printf 'ploam_format=%s\n' "$(uci -q get xg140g-pon.onu.ploam_format 2>/dev/null || true)"
+	printf 'regid_format=%s\n' "$(uci -q get xg140g-pon.onu.regid_format 2>/dev/null || true)"
+	printf 'gpon_regid=%s\n' "$(uci -q get xg140g-pon.onu.gpon_regid 2>/dev/null || true)"
+	} > "$tmp" || return 1
+	chmod 0600 "$tmp" || return 1
+	sync
+	mv -f -- "$tmp" "$REC_ID" || return 1
+	sync
+}
+
+write_journal() {
+	local phase="$1" mode="$2" tmp="$JOURNAL.$$" owner_start owner_boot
+	owner_start="$(sed -n 's/^.*) //p' "/proc/$$/stat" 2>/dev/null | awk '{print $20}')" || return 1
+	owner_boot="$(tr -d '[:space:]' < /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+	[ -n "$owner_start" ] && [ -n "$owner_boot" ] || return 1
+	rm -f -- "$tmp"
+	{
+		printf 'version=1\n'
+		printf 'phase=%s\n' "$phase"
+		printf 'mode=%s\n' "$mode"
+		printf 'action=%s\n' "$APPLY_ACTION"
+		printf 'bosa_present=%s\n' "$SNAP_BOSA_PRESENT"
+		printf 'ri_present=%s\n' "$SNAP_RI_PRESENT"
+		# Keep the lock owner in the durable record.  A SIGKILL leaves the
+		# mkdir-based UCI lease behind; the next invocation can reclaim it only
+		# when this exact owner is no longer alive.
+		printf 'owner_token=%s\n' "$TOKEN"
+		printf 'owner_pid=%s\n' "$$"
+		printf 'owner_starttime=%s\n' "$owner_start"
+		printf 'owner_boot_id=%s\n' "$owner_boot"
+	} > "$tmp" || return 1
+	chmod 0600 "$tmp" || return 1
+	sync
+	mv -f -- "$tmp" "$JOURNAL" || return 1
+	sync
+}
+
+read_journal_field() {
+	local key="$1"
+	sed -n "s/^${key}=//p" "$JOURNAL" | sed -n '1p'
+}
+
+prepare_recovery() {
+	local owner_token owner_pid owner_start owner_boot actual_start actual_boot state
+	[ -e "$JOURNAL" ] || return 0
+	[ -f "$JOURNAL" ] || return 1
+	owner_token="$(read_journal_field owner_token)"
+	owner_pid="$(read_journal_field owner_pid)"
+	owner_start="$(read_journal_field owner_starttime)"
+	owner_boot="$(read_journal_field owner_boot_id)"
+	# Journals from before owner_token was introduced are deliberately not
+	# guessed at: their lock cannot be safely stolen and remain fail-closed.
+	[ -n "$owner_token" ] && [ -n "$owner_start" ] && [ -n "$owner_boot" ] || return 1
+	case "$owner_token" in *[!A-Za-z0-9._-]*|'') return 1;; esac
+	case "$owner_pid" in ''|*[!0-9]*) return 1;; esac
+	if [ -r "/proc/$owner_pid/stat" ]; then
+		actual_start="$(sed -n 's/^.*) //p' "/proc/$owner_pid/stat" 2>/dev/null | awk '{print $20}')"
+		actual_boot="$(tr -d '[:space:]' < /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+		# A PID that was reused after the recorded process exited is safe to
+		# ignore; matching starttime + boot_id is the liveness proof.
+		if [ "$actual_start" = "$owner_start" ] && [ "$actual_boot" = "$owner_boot" ]; then
+		state="$(sed -n 's/^.*) \([^ ]*\).*/\1/p' "/proc/$owner_pid/stat" 2>/dev/null || true)"
+		# A live transaction must never be recovered out from under its owner;
+		# a zombie has already exited and only awaits its parent's reap.
+		[ "$state" = Z ] || return 1
+		fi
+	fi
+	# If the old helper was SIGKILLed, its UCI lock has no EXIT trap.  Release
+	# only when the lock still names the recorded owner; never steal another
+	# caller's lock.
+	if "$LOCK" check "$owner_token" 2>/dev/null; then
+		"$LOCK" end "$owner_token" || return 1
+	fi
+}
+
+clear_recovery() {
+	rm -f -- "$JOURNAL" "$REC_BOSA" "$REC_RI" "$REC_ID"
+	return 0
+}
+
+bosa_word() {
+	local bytes
+	bytes="$(hexdump -v -s "$2" -n 2 -e '1/1 "%u "' "$1" 2>/dev/null)" || return 1
+	set -- $bytes
+	[ "$#" = 2 ] || return 1
+	echo $(( $2 * 256 + $1 ))
+}
+
+bosa_valid() {
+	local file="$1" size imod iav erc
+	size=$(wc -c < "$file" | tr -d '[:space:]')
+	[ "$size" -eq 512 ] || return 1
+	hexdump -v -e '1/1 "%u "' "$file" | awk '{for(i=1;i<=NF;i++) if($i!=0) {ok=1} } END{exit !ok}' || return 1
+	hexdump -v -e '1/1 "%u "' "$file" | awk '{for(i=1;i<=NF;i++) if($i!=255) {ok=1} } END{exit !ok}' || return 1
+	imod="$(bosa_word "$file" 390)" || return 1
+	iav="$(bosa_word "$file" 392)" || return 1
+	erc="$(bosa_word "$file" 398)" || return 1
+	[ "$imod" -gt 0 ] && [ "$imod" -le 4095 ] || return 1
+	[ "$iav" -gt 0 ] && [ "$iav" -le 4095 ] || return 1
+	[ "$erc" -gt 0 ] && [ "$erc" -le 4095 ] || return 1
+}
+
+stage_ri_keys() {
+	local size mfr serial_bytes serial sn mac_bytes mac first
+	size=$(wc -c < "$TMP.decoded" | tr -d '[:space:]')
+	if [ "$size" -eq 262144 ]; then
+		# The raw RI record stores MfrID at byte 2 and the binary G.984 serial
+		# at byte 0x58.  Keep that established GPON_SN import and additionally
+		# import the six-byte MACAddress at offset 0x3e.  Raw RI contains no
+		# subscriber secrets; never manufacture password or registration fields.
+		# Preserve all four bytes of MfrID; only NUL is discarded because shell
+		# variables cannot carry it, and the printable/length check below rejects
+		# any raw record that contained a control byte or a short field.
+		mfr="$(dd if="$TMP.decoded" bs=1 skip=2 count=4 2>/dev/null | tr -d '\000' || true)"
+		serial_bytes="$(hexdump -v -s 88 -n 4 -e '1/1 "%02x "' "$TMP.decoded" 2>/dev/null || true)"
+		set -- $serial_bytes
+		serial=''
+		[ "$#" -eq 4 ] && serial=$(printf '%s%s%s%s' "$1" "$2" "$3" "$4" | tr 'a-f' 'A-F') || true
+		if ! printf '%s' "$mfr" | LC_ALL=C grep -qE '^[[:print:]]{4}$' 2>/dev/null ||
+			! printf '%s' "$serial" | LC_ALL=C grep -qE '^[0-9A-F]{8}$' 2>/dev/null ||
+			[ "$serial" = 00000000 ] || [ "$serial" = FFFFFFFF ]; then
+			return 1
+		fi
+		mac_bytes="$(hexdump -v -s 0x3e -n 6 -e '1/1 "%02x "' "$TMP.decoded" 2>/dev/null || true)"
+		set -- $mac_bytes
+		[ "$#" -eq 6 ] || return 1
+		first="$1"
+		[ $((0x$first & 1)) -eq 0 ] || return 1
+		mac="$(printf '%s:%s:%s:%s:%s:%s' "$1" "$2" "$3" "$4" "$5" "$6" | tr 'a-f' 'A-F')"
+		case "$mac" in
+			00:00:00:00:00:00|FF:FF:FF:FF:FF:FF) return 1;;
+		esac
+		if ! printf '%s' "$mac" | LC_ALL=C grep -qE '^[0-9A-F]{2}(:[0-9A-F]{2}){5}$' 2>/dev/null; then
+			return 1
+		fi
+		{
+			printf 'GPON_SN=%s%s\n' "$mfr" "$serial"
+			printf 'ETHADDR=%s\n' "$mac"
+		} > "$TMP.keys"
+		return 0
+	fi
+	[ "$size" -le 4096 ] || return 1
+	awk '
+		{
+			line=$0; colon=index(line, ":"); equals=index(line, "="); sep=0;
+			if (colon && equals) sep=(colon < equals ? colon : equals);
+			else if (colon) sep=colon; else if (equals) sep=equals;
+			if (!sep) next;
+			key=substr(line,1,sep-1); val=substr(line,sep+1);
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", key);
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", val);
+			sub(/^the[[:space:]]+/, "", key);
+			if (key == "MfrID") { mfr=val; if (val !~ /^[[:print:]]{4}$/) bad=1; }
+			else if (key == "YPSerialNum") { sn=val; }
+			else if (key == "G984Serial") { serial=val; }
+			else if (key == "GPON_SN") { sn=val; }
+			else if (key == "GPON_REGID" || key == "REG_ID" || key == "RegID") { regid=val; }
+			else if (key == "LOID") { loid=val; }
+			else if (key == "PASSWORD") { password=val; }
+			else if (key == "GPON_PW" || key == "PLOAM_PASSWORD" || key == "Password") { ploam_password=val; }
+			else if (key == "SLID") { regid=val; }
+		}
+		END {
+			if (bad) exit 1;
+			if (!sn && serial ~ /^[0-9A-Fa-f]{8}$/ && mfr ~ /^[[:print:]]{4}$/) sn=mfr serial;
+			if (ploam_password != "") print "PLOAM_PASSWORD=" ploam_password;
+			if (sn != "") print "GPON_SN=" sn;
+			if (regid != "") print "GPON_REGID=" regid;
+			if (loid != "") print "LOID=" loid;
+			if (password != "") print "PASSWORD=" password;
+		}
+	' "$TMP.decoded" > "$TMP.keys" || return 1
+	return 0
+}
+
+pending_identity_state() {
+	local keys_file="${1:-$PENDING_DIR/$TOKEN/identity.keys}"
+	local sn='' regid='' loid='' password='' ploam='' key value count=0
+	[ -f "$keys_file" ] || { echo none; return 0; }
+	while IFS='=' read -r key value; do
+		case "$key" in
+			GPON_SN) sn="$value";; GPON_REGID) regid="$value";;
+			LOID) loid="$value";; PASSWORD) password="$value";; PLOAM_PASSWORD) ploam="$value";;
+		esac
+	done < "$keys_file"
+	[ -n "$sn" ] && count=$((count + 1))
+	[ -n "$regid" ] && count=$((count + 1))
+	[ -n "$ploam" ] && count=$((count + 1))
+	[ "$count" -eq 0 ] && [ -z "$loid$password" ] && { echo none; return 0; }
+	[ "$count" -eq 0 ] && [ -n "$loid$password" ] && { echo epon; return 0; }
+	echo present
+}
+
+pending_action() {
+	local dir="${1:-$PENDING_DIR/$TOKEN}" entry name
+	local has_bosa=0 has_identity=0 has_ri=0
+
+	[ -d "$dir" ] && [ ! -L "$dir" ] || {
+		printf '%s\n' invalid
+		return 0
+	}
+	for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+		[ -e "$entry" ] || [ -L "$entry" ] || continue
+		[ -f "$entry" ] && [ ! -L "$entry" ] || {
+			printf '%s\n' invalid
+			return 0
+		}
+		name=${entry##*/}
+		case "$name" in
+			bob.conf) has_bosa=1;;
+			identity.keys) has_identity=1;;
+			ri.bin) has_ri=1;;
+			*)
+				printf '%s\n' invalid
+				return 0
+			;;
+		esac
+	done
+	case "$has_bosa/$has_identity/$has_ri" in
+		1/0/0) printf '%s\n' bosa-only;;
+		0/1/0|0/1/1) printf '%s\n' identity;;
+		0/0/1) printf '%s\n' archive-only;;
+		*) printf '%s\n' invalid;;
+	esac
+}
+
+upload_empty() {
+	# A blank factory partition is a backup, but contains no calibration or RI.
+	hexdump -v -e '1/1 "%u "' "$TMP.decoded" |
+		awk '{ for (i=1; i<=NF; i++) { if ($i != 0) nonzero=1; if ($i != 255) nonff=1 } } END { exit (nonzero && nonff) }'
+}
+
+normalize_bosa() {
+	local size off
+	size=$(wc -c < "$TMP.decoded" | tr -d '[:space:]')
+	if [ "$size" -eq 512 ]; then
+		bosa_valid "$TMP.decoded" || return 1
+		return 0
+	fi
+	[ "$size" -eq 262144 ] || return 1
+	for off in 0 2; do
+		dd if="$TMP.decoded" bs=1 skip="$off" count=512 2>/dev/null > "$TMP.bosa" || true
+		bosa_valid "$TMP.bosa" && { cp -- "$TMP.bosa" "$TMP.decoded"; return 0; }
+	done
+	return 1
+}
+
+copy_raw_upload() {
+	local expected="$3" raw_size copied_size kind
+	case "$1" in
+		bosa_raw) kind=bosa;; ri_raw) kind=ri;; *) return 1;;
+	esac
+	[ "$expected" = "/etc/luci-uploads/xg140g-pon-$TOKEN-$kind.bin" ] || return 1
+	[ -f "$expected" ] && [ ! -L "$expected" ] || return 1
+	raw_size=$(wc -c < "$expected" | tr -d '[:space:]')
+	case "$raw_size" in ''|*[!0-9]*) return 1;; esac
+	[ "$raw_size" -ge 1 ] && [ "$raw_size" -le 262144 ] || return 1
+	cp -- "$expected" "$TMP.decoded" || return 1
+	copied_size=$(wc -c < "$TMP.decoded" | tr -d '[:space:]')
+	[ "$copied_size" = "$raw_size" ]
+}
+
+decode_upload() {
+	if command -v base64 >/dev/null 2>&1 && base64 -d </dev/null >/dev/null 2>&1; then
+		base64 -d
+	elif command -v busybox >/dev/null 2>&1 && busybox base64 -d </dev/null >/dev/null 2>&1; then
+		busybox base64 -d
+	elif command -v lua >/dev/null 2>&1; then
+		lua -e '
+			local alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; local map={}
+			for i=1,#alphabet do map[alphabet:sub(i,i)]=i-1 end
+			local s=io.read("*a"):gsub("%s",""); if (#s%4)~=0 then os.exit(1) end
+			for i=1,#s,4 do local a,b,c,d=s:sub(i,i),s:sub(i+1,i+1),s:sub(i+2,i+2),s:sub(i+3,i+3)
+				if map[a]==nil or map[b]==nil then os.exit(1) end; local n=map[a]*262144+map[b]*4096
+				if c~="=" then if map[c]==nil then os.exit(1) end; n=n+map[c]*64 end
+				if d~="=" then if map[d]==nil then os.exit(1) end; n=n+map[d] end
+				io.write(string.char(math.floor(n/65536)%256)); if c~="=" then io.write(string.char(math.floor(n/256)%256)) end; if d~="=" then io.write(string.char(n%256)) end
+			end'
+	else
+		return 1
+	fi
+}
+
+snapshot_apply_state() {
+	local mode="$1"
+	ensure_pending_dirs || return 1
+	if [ -e "$BOSA" ]; then
+		[ ! -L "$BOSA" ] || return 1
+		atomic_copy "$BOSA" "$REC_BOSA" 0600 || return 1
+		SNAP_BOSA_PRESENT=1
+	else
+		SNAP_BOSA_PRESENT=0; rm -f -- "$REC_BOSA"
+	fi
+	if [ -e "$RI" ]; then
+		[ ! -L "$RI" ] || return 1
+		atomic_copy "$RI" "$REC_RI" 0600 || return 1
+		SNAP_RI_PRESENT=1
+	else
+		SNAP_RI_PRESENT=0; rm -f -- "$REC_RI"
+	fi
+	atomic_write_identity || return 1
+	write_journal prepared "$mode"
+}
+
+restart_pon() {
+	case "$1" in
+	1|6|7)
+		/usr/sbin/pon-moded --start-link || return 1
+		cat /proc/pon_phy/debug >/dev/null 2>&1 || return 1
+		;;
+	2|3|4|5)
+		[ -w /proc/epon/debug ] || return 1
+		printf '%s' 'epon identity_reset' > /proc/epon/debug || return 1
+		cat /proc/epon/debug 2>/dev/null | grep -Eq '^sysStartup=' || return 1
+		;;
+	*) return 1;;
+	esac
+}
+
+bosa_runtime_reload() {
+	local mode="$1"
+	RUNTIME_ERROR=bosa_driver_unavailable
+	[ -w /proc/lddla/debug ] || return 1
+	case "$mode" in
+	0)
+		# A neutral bootstrap has no link to stop/restart. The shared
+		# config lock excludes RX scans while EN7572 reloads calibration.
+		RUNTIME_ERROR=bosa_neutral_state_invalid
+		[ ! -d /sys/module/xpon_10g ] && [ ! -d /sys/module/xpon_gpon ] || return 1
+		[ "$(cat /sys/module/xpon_int/parameters/boot_probe_held 2>/dev/null)" = Y ] || return 1
+		RUNTIME_ERROR=bosa_reload_failed
+		printf '%s' reload_bob > /proc/lddla/debug || return 1
+		RUNTIME_ERROR=
+		return 0 ;;
+	2|3|4|5)
+		RUNTIME_ERROR=bosa_link_stop_failed
+		[ -w /proc/epon/debug ] || return 1
+		printf '%s' 'epon mpcp cal_stop' > /proc/epon/debug || return 1
+		;;
+	1|6|7)
+		RUNTIME_ERROR=bosa_link_stop_failed
+		/usr/sbin/pon-moded --stop-link || return 1
+		;;
+	*) RUNTIME_ERROR=calibration_mode_invalid; return 1;;
+	esac
+	RUNTIME_ERROR=bosa_reload_failed
+	printf '%s' reload_bob > /proc/lddla/debug || return 1
+	RUNTIME_ERROR=bosa_link_start_failed
+	case "$mode" in
+	2|3|4|5)
+		printf '%s' 'epon mpcp cal_start' > /proc/epon/debug || return 1
+		;;
+	1|6|7)
+		/usr/sbin/pon-moded --start-link || return 1
+		cat /proc/pon_phy/debug >/dev/null 2>&1 || return 1
+		;;
+	esac
+	RUNTIME_ERROR=
+}
+
+restore_identity() {
+	local key value ethaddr='' rc=0
+	[ -f "$REC_ID" ] || return 1
+	while IFS='=' read -r key value; do
+		case "$key" in
+			ethaddr) ethaddr="$value"; uci -q set "xg140g-pon.onu.$key=$value" || rc=1;;
+			loid|password|gpon_sn|gpon_regid|ploam_password|ploam_format|regid_format|credential_schema)
+				uci -q set "xg140g-pon.onu.$key=$value" || rc=1;;
+		esac
+		done < "$REC_ID"
+	[ "$rc" -eq 0 ] || return 1
+	uci -q commit xg140g-pon || return 1
+	if [ -n "$ethaddr" ]; then
+		/usr/libexec/xg140g-pon-apply-mac "$ethaddr" >/dev/null 2>&1 || rc=1
+	fi
+	[ "$rc" -eq 0 ]
+}
+
+restore_apply_state() {
+	local mode="$1" rc=0
+	case "$APPLY_ACTION" in
+		bosa-only)
+			if [ "$SNAP_BOSA_PRESENT" -eq 1 ]; then
+				atomic_copy "$REC_BOSA" "$BOSA" 0644 || rc=1
+			else
+				rm -f -- "$BOSA" || rc=1
+			fi
+			if [ "$SNAP_RI_PRESENT" -eq 1 ]; then
+				atomic_copy "$REC_RI" "$RI" 0600 || rc=1
+			else
+				rm -f -- "$RI" || rc=1
+			fi
+			[ "$rc" -ne 0 ] || [ -s "$BOSA" ] || rc=1
+			[ "$rc" -ne 0 ] || bosa_runtime_reload "$mode" || rc=1
+		;;
+		archive-only)
+			if [ "$SNAP_RI_PRESENT" -eq 1 ]; then
+				atomic_copy "$REC_RI" "$RI" 0600 || rc=1
+			else
+				rm -f -- "$RI" || rc=1
+			fi
+		;;
+		identity)
+			if [ "$SNAP_RI_PRESENT" -eq 1 ]; then
+				atomic_copy "$REC_RI" "$RI" 0600 || rc=1
+			else
+				rm -f -- "$RI" || rc=1
+			fi
+			restore_identity || rc=1
+			[ "$rc" -ne 0 ] || /usr/libexec/xg140g-pon-reload luci_identity >/dev/null 2>&1 || rc=1
+		;;
+		*) rc=1;;
+	esac
+	if [ "$rc" -eq 0 ]; then
+		clear_recovery
+	fi
+	return "$rc"
+}
+
+apply_fail() {
+	local error="${3:-calibration_apply_failed}"
+	if ! restore_apply_state "$1"; then
+		logger -t xg140g-pon-calibration 'apply rollback incomplete; persistent recovery journal retained' 2>/dev/null || true
+		error=calibration_recovery_required
+	fi
+	die "$2" "$error"
+}
+
+recover_journal() {
+	local phase mode
+	[ -e "$JOURNAL" ] || return 0
+	[ -f "$JOURNAL" ] || return 1
+	phase="$(sed -n 's/^phase=//p' "$JOURNAL" | sed -n '1p')"
+	mode="$(sed -n 's/^mode=//p' "$JOURNAL" | sed -n '1p')"
+	case "$mode" in 0|1|2|3|4|5|6|7) ;; *) return 1;; esac
+	if grep -q '^action=' "$JOURNAL"; then
+		APPLY_ACTION="$(sed -n 's/^action=//p' "$JOURNAL" | sed -n '1p')"
+	else
+		# Journals written before action was persisted are identity transactions;
+		# never guess a less disruptive action for an ambiguous recovery.
+		APPLY_ACTION=identity
+	fi
+	case "$APPLY_ACTION" in bosa-only|identity|archive-only) ;; *) return 1;; esac
+	SNAP_BOSA_PRESENT="$(sed -n 's/^bosa_present=//p' "$JOURNAL" | sed -n '1p')"
+	SNAP_RI_PRESENT="$(sed -n 's/^ri_present=//p' "$JOURNAL" | sed -n '1p')"
+	case "$SNAP_BOSA_PRESENT/$SNAP_RI_PRESENT" in 0/0|0/1|1/0|1/1) ;; *) return 1;; esac
+	case "$phase" in
+		committed)
+			clear_recovery
+			return 0
+		;;
+		prepared|promoting|runtime)
+			[ "$SNAP_BOSA_PRESENT" -eq 0 ] || [ -f "$REC_BOSA" ] || return 1
+			[ "$SNAP_RI_PRESENT" -eq 0 ] || [ -f "$REC_RI" ] || return 1
+			restore_apply_state "$mode" || return 1
+		;;
+		*) return 1;;
+	esac
+}
+
+selftest() {
+	local root old_tmp
+	root="$(mktemp -d /tmp/xg140g-calibration-selftest.XXXXXX)" || exit 1
+	old_tmp="$TMP"
+	TMP="$root/test"
+	# Minimal valid 512-byte EN7572 record with little-endian A2 words.
+	dd if=/dev/zero of="$root/bosa" bs=512 count=1 2>/dev/null
+	printf '\064\012' | dd of="$root/bosa" bs=1 seek=390 conv=notrunc 2>/dev/null
+	printf '\064\002' | dd of="$root/bosa" bs=1 seek=392 conv=notrunc 2>/dev/null
+	printf '\126\004' | dd of="$root/bosa" bs=1 seek=398 conv=notrunc 2>/dev/null
+	bosa_valid "$root/bosa"
+	cat > "$TMP.decoded" <<'EOF'
+the MfrID: RCOM
+the G984Serial: 5F958450
+GPON_PW: testpw
+GPON_REGID: test-reg:line
+EOF
+	stage_ri_keys
+	grep -q '^GPON_SN=RCOM5F958450$' "$TMP.keys"
+	grep -q '^PLOAM_PASSWORD=testpw$' "$TMP.keys"
+	grep -q '^GPON_REGID=test-reg:line$' "$TMP.keys"
+	dd if=/dev/zero of="$TMP.decoded" bs=262144 count=1 2>/dev/null
+	printf '\122\103\117\115' | dd of="$TMP.decoded" bs=1 seek=2 conv=notrunc 2>/dev/null
+	printf '\137\225\204\120' | dd of="$TMP.decoded" bs=1 seek=88 conv=notrunc 2>/dev/null
+	printf '\002\021\253\315\357\020' | dd of="$TMP.decoded" bs=1 seek=62 conv=notrunc 2>/dev/null
+	stage_ri_keys
+	grep -q '^GPON_SN=RCOM5F958450$' "$TMP.keys"
+	grep -q '^ETHADDR=02:11:AB:CD:EF:10$' "$TMP.keys"
+	if grep -q '^GPON_\(PW\|REGID\)=' "$TMP.keys"; then
+		rm -rf -- "$root"
+		die 'selftest raw RI synthesized GPON credentials'
+	fi
+	for erased in zero ff; do
+		dd if=/dev/zero of="$TMP.decoded" bs=262144 count=1 2>/dev/null
+		printf '\122\103\117\115' | dd of="$TMP.decoded" bs=1 seek=2 conv=notrunc 2>/dev/null
+		printf '\137\225\204\120' | dd of="$TMP.decoded" bs=1 seek=88 conv=notrunc 2>/dev/null
+		printf '\002\021\253\315\357\020' | dd of="$TMP.decoded" bs=1 seek=62 conv=notrunc 2>/dev/null
+		if [ "$erased" = zero ]; then printf '\000\000\000\000'; else printf '\377\377\377\377'; fi |
+			dd of="$TMP.decoded" bs=1 seek=88 conv=notrunc 2>/dev/null
+		if stage_ri_keys 2>/dev/null; then
+			rm -rf -- "$root"; die "selftest accepted erased RI serial ($erased)"
+		fi
+	done
+	for invalid_mac in zero ff multicast; do
+		dd if=/dev/zero of="$TMP.decoded" bs=262144 count=1 2>/dev/null
+		printf '\122\103\117\115' | dd of="$TMP.decoded" bs=1 seek=2 conv=notrunc 2>/dev/null
+		printf '\137\225\204\120' | dd of="$TMP.decoded" bs=1 seek=88 conv=notrunc 2>/dev/null
+		case "$invalid_mac" in
+			zero) printf '\000\000\000\000\000\000';;
+			ff) printf '\377\377\377\377\377\377';;
+			multicast) printf '\001\021\253\315\357\020';;
+		esac | dd of="$TMP.decoded" bs=1 seek=62 conv=notrunc 2>/dev/null
+		if stage_ri_keys 2>/dev/null; then
+			rm -rf -- "$root"; die "selftest accepted invalid RI MAC ($invalid_mac)"
+		fi
+	done
+	rm -rf -- "$root"
+	TMP="$old_tmp"
+	echo 'xg140g-pon-calibration: selftest passed (BOSA + text/raw RI + unified identity)'
+}
+
+if [ "${1:-}" = --selftest ]; then
+	selftest
+	exit 0
+fi
+
+# The token names the pending/<token> and applying/<token> directories, so it
+# must never contain path metacharacters.
+case "$TOKEN" in
+	*[!A-Za-z0-9._-]*) die 'invalid calibration token';;
+esac
+
+init_tmp
+prepare_recovery || die 'unfinished calibration journal is active or unverifiable' 'calibration_recovery_busy'
+bump_lock
+recover_journal || die 'unfinished calibration journal requires recovery' 'calibration_recovery_required'
+
+case "${1:-}" in
+	bosa|bosa_raw)
+		if [ "${1:-}" = bosa_raw ]; then
+			copy_raw_upload "$@" || fail 'invalid BOSA upload path or size' 'invalid_upload'
+		else
+			decode_upload > "$TMP.decoded" 2>/dev/null || die 'invalid BOSA base64'
+		fi
+		if ! normalize_bosa; then
+			upload_empty && fail 'BOSA backup contains no calibration data' 'bosa_empty'
+			fail 'BOSA format or calibration fields invalid' 'bosa_invalid'
+		fi
+		ensure_pending_dirs || die 'pending directory unavailable' 'calibration_storage_failed'
+		sweep_stale_pending
+		STAGE_DIR="$PENDING_DIR/.staging-$TOKEN-$$"
+		rm -rf -- "$STAGE_DIR"
+		mkdir -p "$STAGE_DIR" || die 'staging directory unavailable' 'calibration_storage_failed'
+		atomic_copy "$TMP.decoded" "$STAGE_DIR/bob.conf" 0600 || die 'BOSA pending write failed' 'calibration_storage_failed'
+		# All validation has passed: atomically publish this token's directory.
+		# The target must be absent before the rename: mv onto an existing
+		# directory would nest the staging tree instead of replacing it.
+		rm -rf -- "$PENDING_DIR/$TOKEN" 2>/dev/null || true
+		if [ -e "$PENDING_DIR/$TOKEN" ] ||
+			! mv -- "$STAGE_DIR" "$PENDING_DIR/$TOKEN"; then
+			die 'BOSA staging publish failed' 'calibration_storage_failed'
+		fi
+		printf '%s\n' bosa-staged
+		;;
+	ri|ri_raw)
+		if [ "${1:-}" = ri_raw ]; then
+			copy_raw_upload "$@" || fail 'invalid RI upload path or size' 'invalid_upload'
+		else
+			decode_upload > "$TMP.decoded" 2>/dev/null || die 'invalid RI base64'
+		fi
+		if ! stage_ri_keys; then
+			upload_empty && fail 'RI backup contains no identity data' 'ri_empty'
+			fail 'RI export format invalid' 'ri_invalid'
+		fi
+		ensure_pending_dirs || die 'pending directory unavailable' 'calibration_storage_failed'
+		sweep_stale_pending
+		STAGE_DIR="$PENDING_DIR/.staging-$TOKEN-$$"
+		rm -rf -- "$STAGE_DIR"
+		mkdir -p "$STAGE_DIR" || die 'staging directory unavailable' 'calibration_storage_failed'
+		atomic_copy "$TMP.keys" "$STAGE_DIR/identity.keys" 0600 || die 'RI pending identity write failed' 'calibration_storage_failed'
+		if [ "$(wc -c < "$TMP.decoded" | tr -d '[:space:]')" = 262144 ]; then
+			atomic_copy "$TMP.decoded" "$STAGE_DIR/ri.bin" 0600 || die 'RI pending archive write failed' 'calibration_storage_failed'
+		fi
+		case "$(pending_identity_state "$STAGE_DIR/identity.keys")" in
+			present|epon) printf '%s\n' ri-staged;;
+			none) printf '%s\n' ri-staged-pending;;
+			*) die 'RI identity export is empty';;
+		esac
+		# All validation has passed: atomically publish this token's directory.
+		# The target must be absent before the rename: mv onto an existing
+		# directory would nest the staging tree instead of replacing it.
+		rm -rf -- "$PENDING_DIR/$TOKEN" 2>/dev/null || true
+		if [ -e "$PENDING_DIR/$TOKEN" ] ||
+			! mv -- "$STAGE_DIR" "$PENDING_DIR/$TOKEN"; then
+			die 'RI staging publish failed' 'calibration_storage_failed'
+		fi
+		;;
+		apply)
+			[ -n "${2:-}" ] || die 'calibration token required'
+			mode="$(uci -q get xg140g-pon.onu.mode 2>/dev/null || true)"
+			if [ "$mode" = 0 ]; then
+				mode="$(/usr/sbin/pon-mode-store --effective-mode)" || exit 1
+			fi
+			case "$mode" in 0|1|2|3|4|5|6|7) ;; *) die 'unsupported PON mode' 'calibration_mode_invalid';; esac
+			ensure_pending_dirs || die 'pending directory unavailable' 'calibration_storage_failed'
+			# Atomic claim: the rename moves this token's directory out of
+			# pending/ so a concurrent or repeated apply of the same token
+			# cannot consume it twice.  A failed rename means the token has
+			# already been claimed or was never staged.
+			CLAIMED_DIR="$APPLYING_DIR/$TOKEN"
+			if [ ! -e "$CLAIMED_DIR" ] &&
+				mv -- "$PENDING_DIR/$TOKEN" "$CLAIMED_DIR" 2>/dev/null; then
+				:
+			else
+				fail 'pending calibration unavailable or already claimed' 'pending_unavailable'
+			fi
+			APPLY_ACTION="$(pending_action "$CLAIMED_DIR")"
+			case "$APPLY_ACTION" in
+				bosa-only|identity|archive-only) ;;
+				*) fail 'invalid calibration action' 'invalid_action';;
+			esac
+			snapshot_apply_state "$mode" || die 'apply transaction snapshot failed'
+			write_journal promoting "$mode" || apply_fail "$mode" 'apply journal update failed'
+			case "$APPLY_ACTION" in
+			bosa-only)
+				atomic_copy "$CLAIMED_DIR/bob.conf" "$BOSA" 0644 || apply_fail "$mode" 'BOSA activation failed'
+				bosa_runtime_reload "$mode" || apply_fail "$mode" 'BOSA runtime reload failed' "$RUNTIME_ERROR"
+				;;
+				archive-only)
+					atomic_copy "$CLAIMED_DIR/ri.bin" "$RI" 0600 || apply_fail "$mode" 'RI archive activation failed'
+				;;
+				identity)
+					ethaddr=''
+					if [ -f "$CLAIMED_DIR/ri.bin" ]; then
+						atomic_copy "$CLAIMED_DIR/ri.bin" "$RI" 0600 || apply_fail "$mode" 'RI archive activation failed'
+					fi
+					# Apply each key independently.  A serial-only import updates SN without
+					# pairing it with stale secrets; a partial text import remains valid and
+					# updates only the fields it actually supplied.  GPON_PW is accepted only
+					# as a legacy input spelling and is written only to the PLOAM password key.
+					while IFS='=' read -r key value; do
+						case "$key" in
+							ETHADDR) ethaddr="$value"; uci -q set xg140g-pon.onu.ethaddr="$value" || apply_fail "$mode" 'MAC update failed';;
+							GPON_SN) uci -q set xg140g-pon.onu.gpon_sn="$value" || apply_fail "$mode" 'SN update failed';;
+							GPON_REGID) uci -q set xg140g-pon.onu.gpon_regid="$value" || apply_fail "$mode" 'Registration ID update failed'; uci -q set xg140g-pon.onu.regid_format=ascii || apply_fail "$mode" 'Registration ID format update failed';;
+							LOID) uci -q set xg140g-pon.onu.loid="$value" || apply_fail "$mode" 'LOID update failed';;
+							PLOAM_PASSWORD) uci -q set xg140g-pon.onu.ploam_password="$value" || apply_fail "$mode" 'PLOAM password update failed'; uci -q set xg140g-pon.onu.ploam_format=ascii || apply_fail "$mode" 'PLOAM format update failed'; uci -q set xg140g-pon.onu.credential_schema=2 || apply_fail "$mode" 'Credential schema update failed';;
+							PASSWORD) uci -q set xg140g-pon.onu.password="$value" || apply_fail "$mode" 'LOID password update failed';;
+						esac
+						done < "$CLAIMED_DIR/identity.keys"
+						uci -q commit xg140g-pon || apply_fail "$mode" 'identity commit failed'
+						if [ -n "$ethaddr" ]; then
+							/usr/libexec/xg140g-pon-apply-mac "$ethaddr" >/dev/null 2>&1 || apply_fail "$mode" 'MAC runtime apply failed'
+						fi
+						write_journal runtime "$mode" || apply_fail "$mode" 'apply runtime journal failed'
+						/usr/libexec/xg140g-pon-reload luci_identity >/dev/null 2>&1 || apply_fail "$mode" 'identity runtime reload failed'
+				;;
+			esac
+		write_journal committed "$mode" || apply_fail "$mode" 'apply commit journal failed'
+		clear_recovery
+		# Refresh the displayed model only after the RI transaction commits.
+		# Authentication and model recognition remain separate operations.
+		if [ -f "$CLAIMED_DIR/ri.bin" ] && [ -x /etc/init.d/xg140g-board ]; then
+			/etc/init.d/xg140g-board start >/dev/null 2>&1 ||
+				logger -t xg140g-pon-calibration 'RI applied; runtime model refresh failed'
+		fi
+			# The claimed token directory is consumed atomically on success; on
+			# any earlier failure the EXIT trap returns it to pending/.
+			rm -rf -- "$CLAIMED_DIR"
+			CLAIMED_DIR=
+		printf 'applied %s\n' "$APPLY_ACTION"
+		;;
+	recover)
+		# This internal operation is used before an outer RPC can acquire the
+		# UCI lock.  It is a no-op when no durable journal exists and otherwise
+		# performs the same fail-closed restoration as the next Apply call.
+		printf '%s\n' recovered
+		;;
+	pending_status)
+		# Return only a state label; never expose identity material through ubus.
+		pending_identity_state
+		;;
+	pending_action)
+		# Return the action derived from this token's complete directory shape.
+		pending_action
+		;;
+	*) die 'invalid calibration operation';;
+esac

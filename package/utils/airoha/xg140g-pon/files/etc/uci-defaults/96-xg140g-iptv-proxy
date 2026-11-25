@@ -1,0 +1,131 @@
+#!/bin/ash
+# shellcheck shell=dash
+# Carry IGMP membership between the LAN and a separately bridged IPTV bearer.
+# The OLT may continuously deliver multicast GEM traffic; bridge snooping keeps
+# unsubscribed groups out of LAN ports while igmpproxy forwards LAN joins to
+# the IPTV upstream.  No operator subnet, VLAN or region is assumed here.
+
+set -eu
+
+UCI_BIN="${UCI_BIN:-uci}"
+
+uci_cmd() {
+	"$UCI_BIN" "$@"
+}
+
+section_options() {
+	uci_cmd -q show "igmpproxy.$1" 2>/dev/null |
+		sed -n '2,$s/^[^=]*\.\([^.=]*\)=.*/\1/p' |
+		sort
+}
+
+is_stock_main() {
+	[ "$(section_options "$1")" = "quickleave" ] &&
+		[ "$(uci_cmd -q get "igmpproxy.$1.quickleave")" = "1" ]
+}
+
+is_stock_upstream() {
+	[ "$(section_options "$1")" = "$(printf '%s\n' altnet direction network zone | sort)" ] &&
+		[ "$(uci_cmd -q get "igmpproxy.$1.network")" = "wan" ] &&
+		[ "$(uci_cmd -q get "igmpproxy.$1.zone")" = "wan" ] &&
+		[ "$(uci_cmd -q get "igmpproxy.$1.direction")" = "upstream" ] &&
+		[ "$(uci_cmd -q get "igmpproxy.$1.altnet")" = "192.168.1.0/24" ]
+}
+
+is_stock_downstream() {
+	[ "$(section_options "$1")" = "$(printf '%s\n' direction network zone | sort)" ] &&
+		[ "$(uci_cmd -q get "igmpproxy.$1.network")" = "lan" ] &&
+		[ "$(uci_cmd -q get "igmpproxy.$1.zone")" = "lan" ] &&
+		[ "$(uci_cmd -q get "igmpproxy.$1.direction")" = "downstream" ]
+}
+
+is_managed_config() {
+	local section type
+	for section in $(uci_cmd -q show igmpproxy 2>/dev/null |
+		sed -n 's/^igmpproxy\.\(.*\)=igmpproxy$/\1/p'); do
+		type="$(uci_cmd -q get "igmpproxy.$section.xg140g_managed" 2>/dev/null || true)"
+		[ "$type" != "1" ] || return 0
+	done
+	return 1
+}
+
+is_stock_config() {
+	local section type main=0 upstream=0 downstream=0 total=0
+	for section in $(uci_cmd -q show igmpproxy 2>/dev/null |
+		sed -n 's/^igmpproxy\.\(.*\)=\([a-z][a-z0-9_]*\)$/\1 \2/p'); do
+		# The sed output is consumed as pairs below.
+		if [ -z "${type:-}" ]; then
+			type="$section"
+			continue
+		fi
+		total=$((total + 1))
+		case "$section" in
+		igmpproxy)
+			is_stock_main "$type" || return 1
+			main=$((main + 1))
+			;;
+		phyint)
+			if is_stock_upstream "$type"; then
+				upstream=$((upstream + 1))
+			elif is_stock_downstream "$type"; then
+				downstream=$((downstream + 1))
+			else
+				return 1
+			fi
+			;;
+		*) return 1 ;;
+		esac
+		type=
+	done
+	[ "$total" -eq 3 ] && [ "$main" -eq 1 ] &&
+		[ "$upstream" -eq 1 ] && [ "$downstream" -eq 1 ]
+}
+
+write_managed_config() {
+	# Import without merge semantics so obsolete managed list values disappear.
+	uci_cmd -q import igmpproxy <<'EOF'
+config igmpproxy 'main'
+	option quickleave '1'
+	option xg140g_managed '1'
+
+config phyint 'iptv'
+	option network 'iptv'
+	option zone 'iptv'
+	option direction 'upstream'
+	list altnet '0.0.0.0/0'
+
+config phyint 'lan'
+	option network 'lan'
+	option zone 'lan'
+	option direction 'downstream'
+EOF
+	uci_cmd -q commit igmpproxy
+}
+
+enable_iptv_bridge_snooping() {
+	local iptv_device section type name changed=0
+	iptv_device="$(uci_cmd -q get network.iptv.device 2>/dev/null || true)"
+	[ -n "$iptv_device" ] || return 0
+
+	for section in $(uci_cmd -q show network 2>/dev/null |
+		sed -n 's/^network\.\(.*\)=device$/\1/p'); do
+		type="$(uci_cmd -q get "network.$section.type" 2>/dev/null || true)"
+		name="$(uci_cmd -q get "network.$section.name" 2>/dev/null || true)"
+		if [ "$type" != "bridge" ] || [ "$name" != "$iptv_device" ]; then
+			continue
+		fi
+		[ "$(uci_cmd -q get "network.$section.igmp_snooping" 2>/dev/null || true)" = "1" ] ||
+			uci_cmd -q set "network.$section.igmp_snooping=1"
+		changed=1
+	done
+	[ "$changed" -eq 0 ] || uci_cmd -q commit network
+}
+
+# A managed file is owned by this migration.  The exact package default is
+# safe to replace.  Any other configuration belongs to the user.
+if is_managed_config || is_stock_config; then
+	write_managed_config
+fi
+
+enable_iptv_bridge_snooping
+exit 0

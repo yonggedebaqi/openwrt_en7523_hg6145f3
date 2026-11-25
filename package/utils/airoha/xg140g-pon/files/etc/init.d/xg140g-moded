@@ -1,0 +1,40 @@
+#!/bin/sh /etc/rc.common
+# R1.4.9: observe PCS/registration; apply journaled hot or cold candidates.
+START=42
+STOP=61
+USE_PROCD=1
+
+start_service() {
+	local enabled automatic mode
+	config_load xg140g-pon
+	config_get enabled adapt enabled 1
+	config_get automatic adapt auto 1
+	[ "$enabled" = 1 ] || return 0
+	config_get mode onu mode
+	if [ "$automatic:$mode" = 1:0 ]; then
+		mode="$(/usr/sbin/pon-mode-store --effective-mode)" || return 1
+	fi
+	procd_open_instance
+	if [ "$automatic" = 1 ]; then
+		if [ "$mode" = 0 ] ||
+			{ [ "$(cat /sys/module/xpon_int/parameters/boot_probe_neutral 2>/dev/null)" = Y ] &&
+			  [ ! -e /var/run/pon-bootstrap.complete ]; }; then
+			procd_set_param command /usr/libexec/xg140g-pon-bootstrap
+		else
+			procd_set_param command /usr/sbin/pon-moded
+		fi
+	else
+		procd_set_param command /usr/sbin/pon-moded --observe
+	fi
+	procd_set_param stderr 1
+	procd_set_param stdout 1
+	# A persistent decision or journal error requires intervention; automatic
+	# respawn must not turn an uncertain reboot transaction into a loop.
+	procd_close_instance
+}
+
+stop_service() {
+	procd_kill_instance 2>/dev/null || true
+	# The cross-boot scan journal and OAM/OMCI markers belong to their owners.
+	# A service restart must not replenish the reboot budget.
+}

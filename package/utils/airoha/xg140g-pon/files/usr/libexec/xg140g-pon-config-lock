@@ -1,0 +1,124 @@
+#!/bin/sh
+# LuCI leases span separate helper calls; pon-moded owns a transaction until
+# its process exits. Serialize owner publication/reclamation with flock, and
+# bind daemon ownership to both PID and process start time (PID reuse).
+
+set -efu
+LOCK=/var/run/xg140g-pon.uci-lock
+OWNER=$LOCK/owner
+STALE=300
+
+valid_token() {
+	case "${1:-}" in
+		''|daemon|*[!A-Za-z0-9._-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+process_start() {
+	local stat
+	case "$1" in ''|0|*[!0-9]*) return 1 ;; esac
+	[ -r "/proc/$1/stat" ] || return 1
+	IFS= read -r stat < "/proc/$1/stat" || return 1
+	# comm can contain spaces and ')'; fields after the last ') ' start at 3.
+	stat=${stat##*) }
+	set -- $stat
+	[ "$#" -ge 20 ] || return 1
+	case "$1" in Z|X|x) return 1 ;; esac
+	shift 19
+	printf '%s\n' "$1"
+}
+
+read_owner() {
+	if [ -L "$OWNER" ]; then
+		readlink "$OWNER" 2>/dev/null || true
+	else
+		# Regular-file owners can remain during an in-place package upgrade.
+		sed -n '1{s/[\r\n].*//;p;q;}' "$OWNER" 2>/dev/null || true
+	fi
+}
+
+cold_owner_alive() {
+	local identity pid start
+	identity=${1#cold-}
+	pid=${identity%%:*}
+	start=$(process_start "$pid") || return 1
+	# Old images published only cold-PID; never steal from that live process.
+	[ "$identity" = "$pid" ] || [ "$identity" = "$pid:$start" ]
+}
+
+cold_pending_allows_owner() {
+	case "$1" in cold-*) return 0 ;; esac
+	local pending pending_boot boot
+	pending=$(uci -q get xg140g-pon.adapt.cold_pending 2>/dev/null || true)
+	if [ -n "$pending" ] && [ "$pending" != 0 ]; then
+		pending_boot=$(uci -q get xg140g-pon.adapt.cold_pending_boot 2>/dev/null || true)
+		boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+		[ -n "$boot" ] && [ "$pending_boot" = "$boot" ] && return 1
+	fi
+	return 0
+}
+
+remove_owner() {
+	rm -f "$OWNER"
+	rmdir "$LOCK" 2>/dev/null
+}
+
+case "${1:-}" in begin|end|check) ;; *) exit 2 ;; esac
+token=${2:-}
+valid_token "$token" || exit 2
+key=$token
+case "$token" in
+	cold-*)
+		start=$(process_start "${token#cold-}") || exit 1
+		key="$token:$start"
+		;;
+esac
+
+# Keep this inode: unlinking a flock file would create two independent locks.
+# Hold it only during this helper operation, never for the hardware transaction.
+umask 077
+exec 9>"$LOCK.guard"
+# Wait for the short metadata operation: a failed nonblocking end would leave
+# a live daemon owning the directory after its transaction has finished.
+flock -x 9
+
+case "$1" in
+begin)
+	if [ -d "$LOCK" ]; then
+		owner=$(read_owner)
+		[ "$owner" = "$key" ] && { touch "$LOCK"; exit 0; }
+		if [ "$owner" = "$token" ]; then
+			# Upgrade a legacy cold-PID owner while its same process is live.
+			rm -f "$OWNER"
+			ln -s "$key" "$OWNER"
+			exit 0
+		fi
+		case "$owner" in
+			daemon|daemon:*) exit 1 ;;
+			cold-*) cold_owner_alive "$owner" && exit 1 ;;
+			'')
+				# The publisher also holds the guard. With it acquired here,
+				# an ownerless directory is an interrupted publication.
+				;;
+			*)
+				now=$(date +%s)
+				mtime=$(stat -c %Y "$LOCK") || exit 1
+				[ $((now - mtime)) -ge "$STALE" ] || exit 1
+				;;
+		esac
+		remove_owner || exit 1
+	fi
+	mkdir "$LOCK" || exit 1
+	if ! ln -s "$key" "$OWNER" || ! cold_pending_allows_owner "$token"; then
+		remove_owner
+		exit 1
+	fi
+	exit 0
+	;;
+end|check)
+	owner=$(read_owner)
+	[ "$owner" = "$key" ] || [ "$owner" = "$token" ] || exit 1
+	[ "$1" = check ] || remove_owner
+	;;
+esac

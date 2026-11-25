@@ -1,0 +1,14 @@
+#!/bin/sh
+# Only an incomplete, explicitly armed early-PHY transaction can reboot here.
+# UCI is recovered under its lock on the next boot, never by this timer.
+boot=$1
+marker=/var/run/pon-boot-probe.pending
+sleep 90
+[ "$(cat "$marker" 2>/dev/null)" = "$boot" ] || exit 0
+[ "$(cat /proc/sys/kernel/random/boot_id)" = "$boot" ] || exit 0
+logger -t xg140g-pon 'boot probe startup timed out; rebooting once into cold recovery'
+sync
+reboot
+sleep 10
+[ "$(cat "$marker" 2>/dev/null)" = "$boot" ] || exit 0
+reboot -f

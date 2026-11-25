@@ -1,0 +1,3 @@
+# Preserve active per-unit calibration and RI, not MD32 firmware or test files.
+/etc/lddla/bob.conf
+/etc/lddla/ri.bin

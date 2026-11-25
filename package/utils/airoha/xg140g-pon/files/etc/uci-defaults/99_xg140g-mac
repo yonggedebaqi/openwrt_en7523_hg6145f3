@@ -1,0 +1,68 @@
+#!/bin/sh
+# XG-140G-TF: provision the per-board MAC from U-Boot.
+#
+# The tcboot image labels the environment partition "env" and stores a
+# 0x80000-byte environment at offset 0.  The stock image uses the legacy
+# "u-boot-env" layout.  xg140g-pon-mac handles both geometries and performs
+# read-only U-Boot access; --ensure only creates the Linux fw_env config.
+#
+# The same identity is used for LAN and, when the PON config is empty, for the
+# PON netdev.  No MAC is baked into the distributable image.  PON startup still
+# fails closed unless its NPU/PPE hardware gate passes.
+
+MAC_HELPER=/usr/libexec/xg140g-pon-mac
+
+valid_mac() {
+	local mac first vendor_default_prefix='00:aa:bb:01:23:'
+	case "$1" in
+		[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]) ;;
+		*) return 1 ;;
+	esac
+	mac="$(printf '%s' "$1" | tr 'A-F' 'a-f')" || return 1
+	case "$mac" in
+		00:00:00:00:00:00|ff:ff:ff:ff:ff:ff) return 1 ;;
+		"${vendor_default_prefix}"??) return 1 ;;
+	esac
+	first="${mac%%:*}"
+	[ $((0x$first & 1)) -eq 0 ]
+}
+
+macaddr=''
+[ -x "$MAC_HELPER" ] && macaddr="$($MAC_HELPER --ensure 2>/dev/null || true)"
+
+# If the environment is unavailable, preserve the historical behavior of
+# deriving a LAN MAC from an already-provisioned PON MAC.  This is only a
+# network-identity convenience; it is not a PON datapath fallback.
+if ! valid_mac "$macaddr"; then
+	pon_mac="$(uci -q get xg140g-pon.onu.ethaddr 2>/dev/null || true)"
+	if valid_mac "$pon_mac"; then
+		last=$((0x${pon_mac##*:}))
+		[ "$last" -lt 255 ] || exit 0
+		last=$((last + 1))
+		macaddr="${pon_mac%:*}:$(printf '%02x' "$last")"
+	else
+		exit 0
+	fi
+else
+	# Keep a valid user-provisioned PON MAC; otherwise use the board MAC so
+	# xg140g-pon can create its netdev on a clean or upgraded installation.
+	pon_mac="$(uci -q get xg140g-pon.onu.ethaddr 2>/dev/null || true)"
+	if ! valid_mac "$pon_mac" && uci -q get xg140g-pon.onu >/dev/null 2>&1; then
+		if uci -q set "xg140g-pon.onu.ethaddr=$macaddr" &&
+			uci -q commit xg140g-pon; then
+			logger -t xg140g-mac "PON MAC $macaddr provisioned from U-Boot env"
+		fi
+	fi
+fi
+
+[ -n "$(uci -q get network.@device[0] 2>/dev/null || true)" ] || exit 0
+
+if uci -q set "network.@device[0].macaddr=$macaddr" && uci -q commit network; then
+	logger -t xg140g-mac "LAN MAC $macaddr applied to br-lan"
+	exit 0
+fi
+
+# Valid MAC but apply failed: keep this script so first-boot of the next
+# start retries instead of silently dropping the U-Boot MAC.
+logger -t xg140g-mac "failed to apply LAN MAC $macaddr, will retry next boot"
+exit 1

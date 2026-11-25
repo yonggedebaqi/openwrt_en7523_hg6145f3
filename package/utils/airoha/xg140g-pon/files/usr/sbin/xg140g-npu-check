@@ -1,0 +1,252 @@
+#!/bin/sh
+# Strict EN7581 NPU/PPE hardware-forwarding gate.
+#
+# The R1.3.1 PON path is not allowed to start unless the built-in
+# airoha-npu driver, both firmware images, the NPU mailbox handshake, and
+# the mandatory pon_ppe_glue module are all healthy.  This tree uses the
+# mainline built-in airoha_npu driver (there is no separately loadable
+# npu.ko); the gate therefore checks the platform driver and its handshake.
+
+TAG=xg140g-npu
+NPU_NODE=/sys/bus/platform/devices/1e900000.npu
+GLUE_NODE=/sys/module/pon_ppe_glue
+GLUE_READY_PARAM=$GLUE_NODE/parameters/npu_ready
+FW_DIR=/lib/firmware/airoha
+CT=/proc/net/nf_conntrack
+
+DATA_PLANE=0
+DATA_FILTER=
+DATA_SAMPLE_SECONDS=${XG140G_NPU_SAMPLE_SECONDS:-2}
+
+FW_RV32="$FW_DIR/en7581_npu_rv32.bin"
+FW_DATA="$FW_DIR/en7581_npu_data.bin"
+FW_MANIFEST=/etc/airoha-en7581-npu-firmware.manifest
+
+fail=0
+NOT_OBSERVED=0
+
+note() {
+	logger -t "$TAG" "$*" 2>/dev/null || true
+	printf '%s\n' "$TAG: $*"
+}
+
+case "${1:-}" in
+	'') ;;
+	--data-plane)
+		DATA_PLANE=1
+		shift
+		DATA_FILTER="$*"
+		;;
+	--help|-h)
+		printf '%s\n' "usage: $0 [--data-plane [key=value ...]]"
+		printf '%s\n' '  (default) verify NPU/PPE control-plane readiness'
+		printf '%s\n' '  --data-plane [key=value ...] sample hardware-offloaded conntrack flows'
+		printf '%s\n' '      (optional exact field filter such as dst=203.0.113.7 dport=443) and'
+		printf '%s\n' '      require their summed bytes to increase; exit 3 when no matching'
+		printf '%s\n' '      offloaded flow is observed at all'
+		exit 0
+		;;
+	*)
+		note "ERROR: unknown argument $1 (use --help)"
+		exit 2
+		;;
+esac
+
+check_firmware() {
+	file="$1"
+	name="${file##*/}"
+	entry=""
+	expected_size=""
+	expected_sha=""
+
+	if [ ! -r "$FW_MANIFEST" ]; then
+		note "ERROR: firmware manifest missing: $FW_MANIFEST"
+		fail=1
+		return
+	fi
+	entry="$(awk -v wanted="$name" '$1 == wanted { print $2, $3; exit }' \
+		"$FW_MANIFEST" 2>/dev/null || true)"
+	if [ -z "$entry" ]; then
+		note "ERROR: firmware manifest has no entry for $name"
+		fail=1
+		return
+	fi
+	expected_size="${entry%% *}"
+	expected_sha="${entry#* }"
+
+	if [ ! -r "$file" ]; then
+		note "ERROR: missing firmware $file"
+		fail=1
+		return
+	fi
+
+	# Both GNU coreutils and BusyBox may pad wc's numeric output.  Normalize
+	# it before comparing with the manifest's decimal size.
+	actual_size="$(wc -c < "$file" 2>/dev/null | awk '{print $1}' || true)"
+	if [ "$actual_size" != "$expected_size" ]; then
+		note "ERROR: $name size=$actual_size expected=$expected_size"
+		fail=1
+	fi
+
+	command -v sha256sum >/dev/null 2>&1 || {
+		note "ERROR: sha256sum unavailable; cannot verify $name"
+		fail=1
+		return
+	}
+	actual_sha="$(sha256sum "$file" 2>/dev/null | awk '{print $1}')"
+	if [ "$actual_sha" != "$expected_sha" ]; then
+		note "ERROR: $name sha256=$actual_sha expected=$expected_sha"
+		fail=1
+	fi
+}
+
+check_firmware "$FW_RV32"
+check_firmware "$FW_DATA"
+
+check_data_plane() {
+	local before after flows_before bytes_before flows_after bytes_after
+	if [ ! -r "$CT" ]; then
+		note "ERROR: conntrack table unavailable: $CT"
+		fail=1
+		return
+	fi
+	case "$DATA_SAMPLE_SECONDS" in
+		''|*[!0-9]*)
+			note "ERROR: invalid XG140G_NPU_SAMPLE_SECONDS=$DATA_SAMPLE_SECONDS"
+			fail=1
+			return
+		;;
+	esac
+	case "$DATA_FILTER" in
+		*[!A-Za-z0-9.:=_%\ -]*)
+			note "ERROR: invalid data-plane filter: $DATA_FILTER"
+			fail=1
+			return
+		;;
+	esac
+
+	# OFFLOAD alone means software flowtable handling. Only HW_OFFLOAD is
+	# evidence of hardware rule acceptance; even that flag can be set after
+	# a single direction succeeds. Conntrack bytes do not prove both PPE
+	# directions, so report observations without claiming end-to-end BND.
+	data_plane_sample() {
+		awk -v filt="$DATA_FILTER" '
+		/\[HW_OFFLOAD\]/ {
+			keep = 1
+			if (filt != "") {
+				n = split(filt, kv, /[ \t]+/)
+				for (i = 1; i <= n && keep; i++) {
+					keep = 0
+					for (j = 1; j <= NF; j++)
+						if ($j == kv[i]) { keep = 1; break }
+				}
+			}
+			if (keep) {
+				flows++
+				for (i = 1; i <= NF; i++)
+					if ($i ~ /^bytes=/) { b = $i; sub(/^bytes=/, "", b); bytes += b }
+			}
+		}
+		END { printf "%d %.0f\n", flows + 0, bytes + 0 }
+		' "$CT" 2>/dev/null || true
+	}
+	parse_sample() {
+		set -- $1
+		[ "$#" -eq 2 ] || return 1
+		case "$1:$2" in
+			*[!0-9:]*) return 1 ;;
+		esac
+		printf '%s %s\n' "$1" "$2"
+	}
+
+	before="$(data_plane_sample)"
+	before="$(parse_sample "$before" 2>/dev/null || true)"
+	set -- $before
+	if [ "$#" -ne 2 ]; then
+		note "ERROR: could not parse conntrack HW_OFFLOAD counters (first sample)"
+		fail=1
+		return
+	fi
+	flows_before=$1; bytes_before=$2
+	note "DATA: first sample hw_tagged_flows=$flows_before bytes=$bytes_before"
+	sleep "$DATA_SAMPLE_SECONDS"
+	after="$(data_plane_sample)"
+	after="$(parse_sample "$after" 2>/dev/null || true)"
+	set -- $after
+	if [ "$#" -ne 2 ]; then
+		note "ERROR: could not parse conntrack HW_OFFLOAD counters (second sample)"
+		fail=1
+		return
+	fi
+	flows_after=$1; bytes_after=$2
+	note "DATA: second sample hw_tagged_flows=$flows_after bytes=$bytes_after"
+	if [ "$flows_after" -eq 0 ]; then
+		# No matching offloaded flow observed in the second sample: either none
+		# matched at all, or every match aged out during the window (conntrack
+		# expiry, flow teardown).  A diagnostic outcome, not a gate failure;
+		# reported with its own exit code at the end so it can never mask a
+		# control-plane failure; the boot gate never runs this mode.
+		NOT_OBSERVED=1
+		return
+	fi
+	if [ "$bytes_after" -le "$bytes_before" ]; then
+		note 'NOT-CONFIRMED: HW_OFFLOAD-tagged conntrack bytes did not increase; hardware forwarding is unverified'
+		fail=1
+		return
+	fi
+	note "OBSERVED: HW_OFFLOAD-tagged conntrack bytes increased over ${DATA_SAMPLE_SECONDS}s; both-direction PPE forwarding remains unverified"
+}
+
+if [ ! -d "$NPU_NODE" ]; then
+	note "ERROR: NPU platform node missing: $NPU_NODE"
+	fail=1
+elif [ ! -e "$NPU_NODE/driver" ]; then
+	note "ERROR: NPU platform node has no bound driver"
+	fail=1
+else
+	driver="$(basename "$(readlink -f "$NPU_NODE/driver" 2>/dev/null || true)")"
+	if [ "$driver" != airoha-npu ]; then
+		note "ERROR: NPU driver=$driver expected=airoha-npu"
+		fail=1
+	fi
+fi
+
+if [ ! -d "$GLUE_NODE" ]; then
+	note "ERROR: mandatory pon_ppe_glue is not loaded"
+	fail=1
+elif [ ! -r "$GLUE_READY_PARAM" ]; then
+	note "ERROR: pon_ppe_glue readiness parameter is missing"
+	fail=1
+else
+	glue_ready="$(tr -d '[:space:]' < "$GLUE_READY_PARAM" 2>/dev/null || true)"
+	case "$glue_ready" in
+		1|Y|y) ;;
+		*)
+			note "ERROR: PON PPE/NPU handshake is not ready (npu_ready=$glue_ready)"
+			fail=1
+		;;
+	esac
+fi
+
+# The kernel probe now fails closed when the mailbox firmware-version
+# handshake fails.  Do not use the lossy dmesg ring as a readiness API:
+# after wraparound it can make a healthy NPU look absent.
+note "OK: airoha-npu driver bound; kernel probe enforced firmware handshake"
+note "INFO: this gate proves NPU/PPE control-plane readiness, not per-packet PON attribution"
+
+if [ "$DATA_PLANE" -eq 1 ]; then
+	check_data_plane
+fi
+
+if [ "$fail" -eq 0 ] && [ "$NOT_OBSERVED" -eq 1 ]; then
+	note 'NOT-OBSERVED: no matching HW_OFFLOAD-tagged flow appeared during the sample window; generate PON WAN traffic and retry'
+	exit 3
+fi
+
+if [ "$fail" -eq 0 ]; then
+	note "OK: EN7581 NPU firmware, PPE bridge, and hardware-forwarding control gate passed"
+	exit 0
+fi
+
+note "ERROR: mandatory NPU hardware-forwarding gate failed; PON startup must stop"
+exit 1

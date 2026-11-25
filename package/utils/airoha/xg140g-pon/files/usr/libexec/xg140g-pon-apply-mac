@@ -1,0 +1,175 @@
+#!/bin/sh
+# Apply a validated PON MAC to the live netdev and, for EPON, to the
+# vendor's ONU MAC registers.  The UCI caller invokes this while holding the
+# PON configuration lock; no module unload or reboot is needed.
+
+set -eu
+
+mac=${1:-}
+case "$mac" in
+	[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]) ;;
+	*) exit 2 ;;
+esac
+
+first=${mac%%:*}
+[ $((0x$first & 1)) -eq 0 ] || exit 2
+case "$(printf '%s' "$mac" | tr 'A-F' 'a-f')" in
+	00:00:00:00:00:00|ff:ff:ff:ff:ff:ff|00:aa:bb:01:23:??) exit 2 ;;
+esac
+
+mode=$(uci -q get xg140g-pon.onu.mode 2>/dev/null || true)
+if [ "$mode" = 0 ]; then
+	mode="$(/usr/sbin/pon-mode-store --effective-mode)" || exit 1
+fi
+case "$mode" in
+	0)
+		# No MAC exists during neutral RX detection. Normal activation will
+		# install the committed address in both the provider cache and MAC.
+		[ ! -d /sys/module/xpon_10g ] && [ ! -d /sys/module/xpon_gpon ] &&
+			[ ! -e /sys/class/net/pon ]
+		exit $? ;;
+	1|2|3|4|5|6|7) ;;
+	*) exit 1 ;;
+esac
+
+# The module stack may not have created the netdev yet (for example while a
+# fresh image is still waiting for the NPU probe).  UCI remains the durable
+# source and xg140g-pon will inject it on the next module start.
+if [ -e /sys/class/net/pon ]; then
+	old_mac=$(cat /sys/class/net/pon/address 2>/dev/null || true)
+	[ -n "$old_mac" ] || exit 1
+	old_cache=$(cat /proc/xpon_int_mac 2>/dev/null || true)
+	[ -n "$old_cache" ] || exit 1
+	tmp_netdevs=$(mktemp /tmp/xg140g-pon-mac.XXXXXX) || exit 1
+	trap 'rm -f "$tmp_netdevs"' EXIT HUP INT TERM
+	for dev in pon oam omci x_eapol; do
+		if [ -e "/sys/class/net/$dev" ]; then
+			addr=$(cat "/sys/class/net/$dev/address" 2>/dev/null || true)
+			[ -n "$addr" ] || { rm -f "$tmp_netdevs"; exit 1; }
+			printf '%s %s\n' "$dev" "$addr" >> "$tmp_netdevs"
+		fi
+	done
+
+	restore_netdevs() {
+		while read -r dev addr; do
+			[ -n "$dev" ] || continue
+			ip link set dev "$dev" address "$addr" 2>/dev/null || true
+		done < "$tmp_netdevs"
+	}
+	restore_all() {
+		restore_netdevs
+		/usr/bin/printf '%s\n' "$old_cache" > /proc/xpon_int_mac 2>/dev/null || true
+		case "$mode" in
+			2|3|4|5) write_epon_mac "$old_mac" 2>/dev/null || true ;;
+		esac
+	}
+
+	write_epon_mac() {
+		local value hex hi lo
+		value="$1"
+		hex=$(printf '%s' "$value" | tr -d ':')
+		hi=${hex%????????}
+		lo=${hex#????}
+		[ -w /proc/epon/debug ] || return 1
+		/usr/bin/printf 'epon mac_addr %s %s\n' "$hi" "$lo" > /proc/epon/debug
+	}
+	verify_epon_mac() {
+		local value hex hi lo log hi_match lo_match start_uptime
+		value="$1"
+		hex=$(printf '%s' "$value" | tr -d ':')
+		hi=$(printf '%s' "${hex%????????}" | tr 'a-f' 'A-F')
+		lo=$(printf '%s' "${hex#????}" | tr 'a-f' 'A-F')
+		# The vendor epon_debug command registers show_hw_mac and its
+		# epon_get_mac_address() path prints the two words with %8X.  That
+		# format pads with spaces (not zeroes), so normalize leading zeroes
+		# before matching while still requiring the complete hexadecimal word.
+		hi_match=$(printf '%s' "$hi" | sed 's/^0*//')
+		lo_match=$(printf '%s' "$lo" | sed 's/^0*//')
+		[ -n "$hi_match" ] || hi_match=0
+		[ -n "$lo_match" ] || lo_match=0
+		# dmesg can retain an older successful readback for the same MAC.  The
+		# kernel log timestamp and /proc/uptime share the monotonic boot clock,
+		# so only lines emitted after this command boundary are admissible.
+		# BusyBox /proc/uptime is commonly rounded to centiseconds while
+		# printk carries microseconds.  Leave a small monotonic safety window
+		# so a line emitted at the rounded boundary is not rejected; separate
+		# transactions are serialized by the UCI lock, so this does not reopen
+		# the old-log match across requests.
+		start_uptime=$(awk '{printf "%.6f", ($1 - 0.10)}' /proc/uptime 2>/dev/null || true)
+		case "$start_uptime" in
+			''|*[!0-9.]*) return 1 ;;
+		esac
+		# printk is asynchronous on the target; poll briefly instead of
+		# treating a just-issued command with not-yet-visible dmesg output as
+		# a hardware write failure.
+		for attempt in 1 2 3 4 5; do
+			# Some EN7581 revisions emit only the low word on the first
+			# indirect-read transaction.  Re-issue the read command for each
+			# poll; accepting a low-only response would be a false success.
+			/usr/bin/printf 'epon show_hw_mac 0\n' > /proc/epon/debug || return 1
+			log=$(dmesg 2>/dev/null | awk -v start="$start_uptime" '
+				/^\[[[:space:]]*[0-9]+\.[0-9]+\]/ {
+					ts = $0
+					sub(/^\[[[:space:]]*/, "", ts)
+					sub(/\].*$/, "", ts)
+					if ((ts + 0) >= (start + 0)) print
+				}
+			' || true)
+			if printf '%s\n' "$log" | grep -Eiq "get 1 macLow ==[[:space:]]*0*$lo_match([[:space:]]|$)" &&
+				printf '%s\n' "$log" | grep -Eiq "get 2 macHigh ==[[:space:]]*0*$hi_match([[:space:]]|$)"; then
+				return 0
+			fi
+			sleep 1
+		done
+		return 1
+	}
+
+	for dev in pon oam omci x_eapol; do
+		[ -e "/sys/class/net/$dev" ] || continue
+		ip link set dev "$dev" address "$mac" || {
+			restore_netdevs
+			exit 1
+		}
+	done
+	/usr/bin/printf '%s\n' "$mac" > /proc/xpon_int_mac || {
+		restore_netdevs
+		/usr/bin/printf '%s\n' "$old_cache" > /proc/xpon_int_mac 2>/dev/null || true
+		exit 1
+	}
+	if [ "$(tr 'a-f' 'A-F' < /proc/xpon_int_mac 2>/dev/null)" != \
+		"$(printf '%s' "$mac" | tr 'a-f' 'A-F')" ]; then
+		restore_all
+		exit 1
+	fi
+	case "$mode" in
+		2|3|4|5)
+			# epon_debug parses a 16-bit high word followed by a 32-bit low
+			# word.  Keep the exact byte order used by doEponMacAddr().
+			if ! write_epon_mac "$mac"; then
+				restore_all
+				exit 1
+			fi
+			if ! verify_epon_mac "$mac"; then
+				restore_all
+				exit 1
+			fi
+			if pidof epon_oamd >/dev/null 2>&1 &&
+				! /etc/init.d/xg140g-oam restart >/dev/null 2>&1; then
+				restore_all
+				exit 1
+			fi
+			;;
+		*)
+			# ITU-PON has no EPON LLID MAC register.  The netdev address is
+			# the live consumer; the next module start still receives ethaddr.
+			;;
+	esac
+	# Verify the Linux-facing address after the driver ndo_set_mac_address.
+	if [ "$(tr 'a-f' 'A-F' < /sys/class/net/pon/address 2>/dev/null)" != \
+		"$(printf '%s' "$mac" | tr 'a-f' 'A-F')" ]; then
+		restore_all
+		exit 1
+	fi
+fi
+
+exit 0

@@ -1,0 +1,715 @@
+#!/bin/sh /etc/rc.common
+# XG-140G-TF PON module gate for OpenWrt 6.18.
+#
+# Modes (XMCSIF_WanDetectionMode_t):
+#   1 GPON, 2 EPON, 3 XEPON-ASYM, 4 XEPON-SYM, 5 XEPON-1G,
+#   6 XG-PON, 7 XGS-PON.
+#
+# onu_type is a hex byte: bit[7:4]=PON mode nibble, bit[1:0]=ONU type (2=HGU).
+# Mode N maps to onu_type "N2" (e.g. mode 3 → "32").
+#
+# ITU modes 1/6/7 start xg140g-omcid. EPON/XEPON modes use the kernel
+# IEEE 802.3ah OAM path plus the epon_oamd userspace daemon.
+#
+# Design: fail-fast. Missing/invalid config, module load failure, or
+# hardware state mismatch all cause start to return non-zero. No fallback
+# to defaults, no silent success after a failure.
+
+START=40
+STOP=60
+
+
+KVER="$(uname -r)"
+MODDIR="/lib/modules/$KVER"
+STARTED_FILE="/var/run/xg140g-pon.started"
+LDDLA_BOB_FILE="/etc/lddla/bob.conf"
+NPU_DEVICE="1e900000.npu"
+NPU_NODE="/sys/bus/platform/devices/$NPU_DEVICE"
+NPU_DRIVER_DIR="/sys/bus/platform/drivers/airoha-npu"
+NPU_PROBE_TIMEOUT=60
+
+config_value() {
+	local name="$1" value
+	config_get value onu "$name"
+	case "$name:$value" in
+		mode:0) /usr/sbin/pon-mode-store --effective-mode; return $? ;;
+		onu_type:0?) value="$(/usr/sbin/pon-mode-store --effective-mode)${value#?}" || return 1 ;;
+	esac
+	echo "$value"
+}
+
+valid_mode() {
+	case "$1" in
+		1|2|3|4|5|6|7) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+mode_to_onu_prefix() {
+	case "$1" in
+		1) echo 1 ;;
+		2) echo 2 ;;
+		3) echo 3 ;;
+		4) echo 4 ;;
+		5) echo 5 ;;
+		6) echo 6 ;;
+		7) echo 7 ;;
+		*) return 1 ;;
+	esac
+}
+
+valid_ethaddr() {
+	local mac first vendor_default_prefix='00:aa:bb:01:23:'
+	case "$1" in
+		[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]) ;;
+		*) return 1 ;;
+	esac
+	mac="$(printf '%s' "$1" | tr 'A-F' 'a-f')" || return 1
+	case "$mac" in
+		00:00:00:00:00:00|ff:ff:ff:ff:ff:ff)
+			return 1 ;;
+		"${vendor_default_prefix}"??) return 1 ;;
+	esac
+	first="${mac%%:*}"
+	[ $((0x$first & 1)) -eq 0 ]
+}
+
+provision_ethaddr() {
+	local mac
+	[ -x /usr/libexec/xg140g-pon-mac ] || return 1
+	mac="$(/usr/libexec/xg140g-pon-mac --ensure 2>/dev/null)" || return 1
+	valid_ethaddr "$mac" || return 1
+	# Persist only when the product config is empty/invalid.  This reads the
+	# per-board U-Boot identity; it never writes U-Boot and does not relax the
+	# mandatory NPU/PPE hardware gate below.
+	uci -q set "xg140g-pon.onu.ethaddr=$mac" || return 1
+	uci -q commit xg140g-pon || return 1
+	printf '%s\n' "$mac"
+}
+
+# The vendor 1G EPON selector is sampled by xmcs_set_connection_start()
+# from inside the first `gpon startup 1`.  Route the operation through the
+# installed pon-moded ABI wrapper so the selector is armed before that start,
+# and make a failed arm/disarm a hard init failure.
+automode_action() {
+	local action="$1" mode="$2"
+
+	case "$mode" in
+		5) ;;
+		*) return 0 ;;
+	esac
+	[ -x /usr/sbin/pon-moded ] || {
+		logger -t xg140g-pon "pon-moded automode helper missing for mode=$mode"
+		return 1
+	}
+	/usr/sbin/pon-moded "$action" "$mode" || {
+		logger -t xg140g-pon "automode $action failed for mode=$mode"
+		return 1
+	}
+}
+
+arm_automode() {
+	automode_action --arm-automode "$1"
+}
+
+disarm_automode() {
+	automode_action --disarm-automode "$1"
+}
+
+valid_trans_index() {
+	case "$1" in
+		-1|[0-9]|0[0-9]|[1-8][0-9]|9[0-3]) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+module_loaded() {
+	lsmod 2>/dev/null | awk -v m="$1" '$1 == m { found=1 } END { exit !found }'
+}
+
+module_params_match() {
+	local module="$1"; shift
+	local p v
+	for p in "$@"; do
+		case "$p" in
+			*=*)
+				v="${p#*=}"
+				[ "$(cat "/sys/module/$module/parameters/${p%%=*}" 2>/dev/null)" = "$v" ] || return 1
+				;;
+		esac
+	done
+	return 0
+}
+
+ensure_npu_driver() {
+	local elapsed=0 driver
+
+	[ -d "$NPU_NODE" ] || {
+		logger -t xg140g-pon "NPU platform node missing: $NPU_NODE"
+		return 1
+	}
+	if [ -e "$NPU_NODE/driver" ]; then
+		driver="$(basename "$(readlink -f "$NPU_NODE/driver" 2>/dev/null || true)")"
+		[ "$driver" = "airoha-npu" ] || {
+			logger -t xg140g-pon "NPU bound to unexpected driver=$driver"
+			return 1
+		}
+		return 0
+	fi
+
+	# Built-in airoha-npu may probe once before the squashfs root is mounted,
+	# so request_firmware() returns -EPROBE_DEFER.  Give the platform bus a
+	# bounded retry and, when it has not retried yet, explicitly bind the same
+	# driver now that /lib/firmware is available.  Never unbind a live driver.
+	if [ -w "$NPU_DRIVER_DIR/bind" ]; then
+		printf '%s' "$NPU_DEVICE" > "$NPU_DRIVER_DIR/bind" 2>/dev/null ||
+			logger -t xg140g-pon "NPU deferred bind request failed; waiting for retry"
+	fi
+	while [ "$elapsed" -lt "$NPU_PROBE_TIMEOUT" ]; do
+		if [ -e "$NPU_NODE/driver" ]; then
+			driver="$(basename "$(readlink -f "$NPU_NODE/driver" 2>/dev/null || true)")"
+			[ "$driver" = "airoha-npu" ] || {
+				logger -t xg140g-pon "NPU bound to unexpected driver=$driver"
+				return 1
+			}
+			logger -t xg140g-pon "NPU driver bound after deferred-probe wait (${elapsed}s)"
+			return 0
+		fi
+		sleep 1
+		elapsed=$((elapsed + 1))
+	done
+	logger -t xg140g-pon "NPU driver did not bind within ${NPU_PROBE_TIMEOUT}s"
+	return 1
+}
+
+load_module() {
+	local module="$1"; shift
+	local path="$MODDIR/$module.ko"
+	[ -f "$path" ] || { logger -t xg140g-pon "missing $module.ko"; return 1; }
+	if module_loaded "$module"; then
+		if ! module_params_match "$module" "$@"; then
+			logger -t xg140g-pon "CONFIG_MISMATCH: $module already loaded with different params"
+			return 1
+		fi
+		return 0
+	fi
+	insmod "$path" "$@" || {
+		logger -t xg140g-pon "insmod $module failed"
+		return 1
+	}
+}
+
+validate_lddla_calibration() {
+	local size imod iav erc bytes
+	bosa_word() {
+		bytes="$(hexdump -v -s "$1" -n 2 -e '1/1 "%u "' "$LDDLA_BOB_FILE" 2>/dev/null)" || return 1
+		set -- $bytes
+		[ "$#" = 2 ] || return 1
+		echo $(( $2 * 256 + $1 ))
+	}
+	[ -r "$LDDLA_BOB_FILE" ] || {
+		logger -t xg140g-pon "EN7572 calibration absent; using driver defaults"
+		return 0
+	}
+	size="$(wc -c < "$LDDLA_BOB_FILE" 2>/dev/null)" || return 1
+	[ "$size" = 512 ] || {
+		logger -t xg140g-pon "invalid EN7572 calibration size=$size; using driver defaults"
+		return 0
+	}
+	# A blank factory bob.conf is valid as a placeholder: calibration is an
+	# optional runtime operation and must never prevent the PON link from
+	# starting.  The calibration helper remains strict before applying data.
+	if ! hexdump -v -e '1/1 "%u "' "$LDDLA_BOB_FILE" | awk '{for(i=1;i<=NF;i++) if($i!=0) {ok=1} } END{exit !ok}'; then
+		logger -t xg140g-pon "EN7572 calibration is all-zero; using driver defaults"
+		return 0
+	fi
+	if ! hexdump -v -e '1/1 "%u "' "$LDDLA_BOB_FILE" | awk '{for(i=1;i<=NF;i++) if($i!=255) {ok=1} } END{exit !ok}'; then
+		logger -t xg140g-pon "EN7572 calibration is erased; using driver defaults"
+		return 0
+	fi
+	imod="$(bosa_word 390)" || return 1
+	iav="$(bosa_word 392)" || return 1
+	erc="$(bosa_word 398)" || return 1
+	[ "$imod" -gt 0 ] && [ "$imod" -le 4095 ] || { logger -t xg140g-pon "EN7572 IMOD invalid; using driver defaults"; return 0; }
+	[ "$iav" -gt 0 ] && [ "$iav" -le 4095 ] || { logger -t xg140g-pon "EN7572 IAV invalid; using driver defaults"; return 0; }
+	[ "$erc" -gt 0 ] && [ "$erc" -le 4095 ] || { logger -t xg140g-pon "EN7572 ERC invalid; using driver defaults"; return 0; }
+	return 0
+}
+
+prepare_pon_wan() {
+	local master
+	/usr/libexec/xg140g-pon-wan-gate prepare || return 1
+	[ -d /sys/class/net/pon ] || {
+		logger -t xg140g-pon "pon netdev missing"
+		return 1
+	}
+	master="$(readlink -f /sys/class/net/pon/master 2>/dev/null)"
+	if [ -n "$master" ] && ! ip link set dev pon nomaster 2>/dev/null; then
+		logger -t xg140g-pon "cannot detach pon from old bridge"
+		return 1
+	fi
+	ip link set dev pon up || {
+		logger -t xg140g-pon "cannot bring up pon (NAPI owner absent)"
+		return 1
+	}
+	# CTC authentication, not netdev creation, makes the PON data plane
+	# usable.  epon_oamd starts wan/wan6 after it has confirmed LLID forwarding.
+	return 0
+}
+
+reload_fw4_after_glue() {
+	# The provider can bind a flowtable before PON registration. Rebuild it
+	# once when the provider appears, without changing the user's offload
+	# settings. Per-flow admission in the driver owns PON readiness.
+	/etc/init.d/firewall reload || {
+		logger -t xg140g-pon "cannot bind firewall flowtable to PON PPE provider"
+		return 1
+	}
+	return 0
+}
+
+validate_fw4_offload() {
+	local flow flow_hw
+
+	# R1.3.1: this remains informational rather than a PON-start gate.  The
+	# NPU/PPE checks prove the control plane only; they do not claim per-packet
+	# PON egress or BND data-plane completion. Global acceleration follows
+	# the user's settings; PON readiness is checked per flow in the driver.
+	flow="$(uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null || true)"
+	flow_hw="$(uci -q get firewall.@defaults[0].flow_offloading_hw 2>/dev/null || true)"
+	logger -t xg140g-pon "fw4 offload uci state (flow=$flow hw=$flow_hw) - informational, not a gate"
+	return 0
+}
+
+omci_gate() {
+	case "$1" in
+		start)
+			[ -x /etc/init.d/xg140g-omcid ] || {
+				logger -t xg140g-pon "xg140g-omcid init script missing"
+				return 1
+			}
+			/etc/init.d/xg140g-omcid start ;;
+		stop)
+			[ -x /etc/init.d/xg140g-omcid ] || return 0
+			# In EPON/XEPON mode omcid is deliberately never registered.  Calling
+			# its procd stop path anyway returns "Not found" and turns a harmless
+			# PON stop into a half-completed stop/start transaction.
+			pidof omcid >/dev/null 2>&1 || return 0
+			/etc/init.d/xg140g-omcid stop ;;
+		*) return 2 ;;
+	esac
+}
+
+# Isolate traps to this start invocation, including all fail-fast returns.
+start() (
+	PON_BOOT_TOKEN=""
+	PON_BOOT_ID="$(cat /proc/sys/kernel/random/boot_id)"
+	trap '[ -z "$PON_BOOT_TOKEN" ] || /usr/libexec/xg140g-pon-config-lock end "$PON_BOOT_TOKEN" >/dev/null 2>&1' 0
+	trap 'exit 1' 1 2 15
+	start_modules
+)
+
+start_modules() {
+	# The upstream native board ABI alone does not prove vendor PON ownership.
+	if [ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = nokia,xg-040g-md-ubi ] &&
+		[ ! -e /sys/firmware/devicetree/base/xg140g,pon-stack ]; then
+		logger -t xg140g-pon "native board DT does not reserve the vendor PON dataplane"
+		return 1
+	fi
+	local mode onu_type onu_hex onu_prefix ethaddr trans_index gpon_sn gpon_regid password ploam_format regid_format
+	local xpon_args="" phy_args="" int_args="" automode_armed=0 mac_module=xpon_10g phy_loaded=0
+	local configured_mode neutral_boot=0 provider_mac
+	local boot_probe=0 probe_preferred=0 probe_enabled probe_auto probe_opt probe_cross pending count scan_mask result held probe_pending sync_mode
+
+	config_load xg140g-pon
+	# Probe only on an entirely fresh module lifecycle. Re-read configuration
+	# under the same writer lock held through probe, atomic commit and MAC init.
+	config_get configured_mode onu mode
+	config_get probe_pending adapt boot_probe_pending ""
+	config_get_bool probe_opt adapt boot_probe 0
+	config_get_bool probe_enabled adapt enabled 1
+	config_get_bool probe_auto adapt auto 1
+	config_get_bool probe_cross adapt enable_gpon_switch 1
+	if { [ "$probe_opt$probe_enabled$probe_auto" = 111 ] || [ -n "$probe_pending" ] || [ "$configured_mode" = 0 ]; } &&
+		! module_loaded xpon_int && ! module_loaded phy_10g && ! module_loaded xpon_10g && ! module_loaded xpon_gpon; then
+		PON_BOOT_TOKEN="boot-$$-$PON_BOOT_ID"
+		/usr/libexec/xg140g-pon-config-lock begin "$PON_BOOT_TOKEN" || {
+			PON_BOOT_TOKEN=""
+			logger -t xg140g-pon "boot probe configuration lock unavailable"
+			return 1
+		}
+		/usr/sbin/pon-mode-store --boot-recover "$PON_BOOT_ID" || return 1
+		if [ "$configured_mode" = 0 ]; then
+			/usr/sbin/pon-mode-store --init || return 1
+			/usr/sbin/pon-mode-store --prepare-auto || return 1
+		fi
+		config_load xg140g-pon
+		config_get_bool probe_opt adapt boot_probe 0
+		config_get_bool probe_enabled adapt enabled 1
+		config_get_bool probe_auto adapt auto 1
+		config_get_bool probe_cross adapt enable_gpon_switch 1
+		config_get pending adapt cold_pending 0
+		config_get count adapt cold_count 0
+		config_get scan_mask adapt cold_mask 0
+		case "$scan_mask" in ''|*[!0-9]*) scan_mask=65535 ;; esac
+		case "$count" in ''|*[!0-9]*) count=8 ;; esac
+		case "$(config_value mode)" in
+			0)
+				# No historical candidate: load only common/PHY resources.
+				# A procd worker will obtain framing before selecting a MAC.
+				[ "$probe_opt$probe_enabled$probe_auto" = 111 ] || {
+					logger -t xg140g-pon "unknown PON mode requires automatic RX detection"
+					return 1
+				}
+				neutral_boot=1
+				boot_probe=1 ;;
+			3|4|6|7)
+				if [ "$probe_opt$probe_enabled$probe_auto" = 111 ] &&
+					[ "$pending" = 0 ] && [ "$count" -lt 8 ] && [ "$scan_mask" -lt 32768 ]; then
+					/usr/sbin/pon-mode-store --init || return 1
+					config_get probe_preferred adapt cold_last_good 0
+					case "$probe_preferred" in 3|4|6|7) ;; *) probe_preferred=0 ;; esac
+					boot_probe=1
+				fi ;;
+		esac
+	fi
+	validate_fw4_offload || return 1
+	mode="$(config_value mode)"
+	{ valid_mode "$mode" || [ "$neutral_boot:$mode" = 1:0 ]; } || {
+		logger -t xg140g-pon "unsupported PON mode=$mode"
+		return 2
+	}
+
+	onu_type="$(config_value onu_type)"
+	[ -n "$onu_type" ] || {
+		logger -t xg140g-pon "missing onu_type for mode=$mode"
+		return 1
+	}
+	case "$onu_type" in
+		0[xX]*) onu_hex="${onu_type#0[xX]}" ;;
+		*) onu_hex="$onu_type" ;;
+	esac
+	if [ "$neutral_boot" = 1 ]; then
+		onu_prefix=0
+	else
+	onu_prefix="$(mode_to_onu_prefix "$mode")" || {
+		logger -t xg140g-pon "unsupported PON mode=$mode"
+		return 2
+	}
+	fi
+	case "$onu_hex" in
+		"$onu_prefix"[0-9a-fA-F]) ;;
+		*)
+			logger -t xg140g-pon "invalid onu_type='$onu_type' for mode=$mode"
+			return 1
+			;;
+	esac
+	onu_type="$onu_hex"
+
+	ethaddr="$(config_value ethaddr)"
+	if ! valid_ethaddr "$ethaddr"; then
+		ethaddr="$(provision_ethaddr)" || {
+			logger -t xg140g-pon "invalid or missing PON MAC; PON start refused"
+			return 1
+		}
+		logger -t xg140g-pon "PON MAC provisioned from U-Boot env: $ethaddr"
+	fi
+
+	trans_index="$(config_value trans_index)"
+	[ -n "$trans_index" ] || {
+		logger -t xg140g-pon "missing trans_index; PON start refused"
+		return 1
+	}
+	valid_trans_index "$trans_index" || {
+		logger -t xg140g-pon "invalid trans_index='$trans_index'"
+		return 1
+	}
+
+	ensure_npu_driver || {
+		logger -t xg140g-pon "mandatory NPU driver/firmware probe failed"
+		return 1
+	}
+
+	gpon_sn="$(config_value gpon_sn)"
+	gpon_regid="$(config_value gpon_regid)"
+	password="$(config_value ploam_password)"
+	ploam_format="$(config_value ploam_format)"
+	regid_format="$(config_value regid_format)"
+	: "${ploam_format:=ascii}" "${regid_format:=ascii}"
+
+	int_args="onutype=$onu_type ethaddr=$ethaddr boot_probe=$boot_probe boot_probe_preferred=$probe_preferred boot_probe_cross_family=$probe_cross"
+	if [ "$neutral_boot" = 0 ] &&
+		[ "$(cat /sys/module/xpon_int/parameters/boot_probe_neutral 2>/dev/null)" = Y ]; then
+		# The common provider was loaded in UNKNOWN mode. Its immutable
+		# module parameters stay neutral; only its attested runtime selector
+		# has advanced. Keep ordinary parameter-mismatch checks intact.
+		[ "$probe_enabled:$probe_auto" = 1:1 ] || return 1
+		[ "$(cat /sys/module/xpon_int/parameters/boot_probe_result)" = "$mode" ] || return 1
+		[ "$(cat /sys/module/xpon_int/parameters/boot_probe_sync_mode)" = "$mode" ] || return 1
+		# Identity can be edited while RX is still unknown. The provider's
+		# module parameter is immutable, but its shared MAC cache is writable
+		# before either MAC module consumes it.
+		/usr/bin/printf '%s\n' "$ethaddr" > /proc/xpon_int_mac || return 1
+		[ "$(tr 'A-F' 'a-f' < /proc/xpon_int_mac)" = "$(printf '%s' "$ethaddr" | tr 'A-F' 'a-f')" ] || return 1
+		provider_mac="$(cat /sys/module/xpon_int/parameters/ethaddr)" || return 1
+		# sysfs renders bool module parameters as Y/N, unlike UCI's 1/0.
+		if [ "$probe_cross" = 1 ]; then probe_cross=Y; else probe_cross=N; fi
+		int_args="onutype=0${onu_type#?} ethaddr=$provider_mac boot_probe=Y boot_probe_preferred=0 boot_probe_cross_family=$probe_cross"
+	fi
+	xpon_args="mode=$mode ethaddr=$ethaddr"
+	phy_args="trans_index=$trans_index"
+
+	[ "$mode" != 1 ] || mac_module=xpon_gpon
+	# Clear stale marker if modules were manually unloaded
+	if [ -e "$STARTED_FILE" ] &&
+		{ ! module_loaded "$mac_module" || ! module_loaded phy_10g; }; then
+		rm -f "$STARTED_FILE"
+	fi
+
+	if [ "$boot_probe:$neutral_boot" = 1:0 ]; then
+		# Persist the failure latch before any driver mutation. The guard never
+		# writes UCI concurrently; the following boot performs recovery.
+		/usr/sbin/pon-mode-store --boot-arm "$mode" "$PON_BOOT_ID" || return 1
+		printf '%s\n' "$PON_BOOT_ID" > /var/run/pon-boot-probe.pending || return 1
+		/bin/sh /usr/libexec/xg140g-pon-boot-guard "$PON_BOOT_ID" >/dev/null 2>&1 &
+	fi
+
+	# Load modules in dependency order
+	load_module xpon_int $int_args || return 1
+	load_module skbmgr || return 1
+
+	# skbmgr must report limit=0 (unlimited allocator, product config)
+	if [ ! -r /proc/net/skbmgr_limit ] ||
+		[ "$(head -n 1 /proc/net/skbmgr_limit 2>/dev/null)" != "0" ]; then
+		logger -t xg140g-pon "skbmgr unlimited allocator invariant failed"
+		return 1
+	fi
+
+	load_module qdma_wan || return 1
+
+	validate_lddla_calibration || {
+		logger -t xg140g-pon "EN7572 calibration validation failed; refusing laser init"
+		return 1
+	}
+
+	load_module en7572 || return 1
+	if [ "$neutral_boot" = 1 ]; then
+		load_module phy_10g $phy_args || return 1
+		[ "$(cat /sys/module/xpon_int/parameters/boot_probe_held)" = Y ] || return 1
+		logger -t xg140g-pon "PON mode unknown; RX-only bootstrap ready, MAC absent and TX inhibited"
+		return 0
+	fi
+	if [ "$boot_probe" = 1 ]; then
+		# This cold-only PHY load scans RX with TX held disabled. MAC is absent.
+		load_module phy_10g $phy_args || return 1
+		phy_loaded=1
+		result="$(cat /sys/module/xpon_int/parameters/boot_probe_result 2>/dev/null)"
+		held="$(cat /sys/module/xpon_int/parameters/boot_probe_held 2>/dev/null)"
+		case "$result:$held" in 3:Y|4:Y|6:Y|7:Y) ;; *)
+			logger -t xg140g-pon "boot probe incomplete; MAC start refused with TX inhibited"
+			return 1 ;;
+		esac
+		/usr/sbin/pon-mode-store --boot-select "$mode" "$result" || {
+			logger -t xg140g-pon "boot probe commit failed; MAC start refused with TX inhibited"
+			return 1
+		}
+		mode="$result"
+		onu_type="${mode}${onu_type#?}"
+		xpon_args="mode=$mode ethaddr=$ethaddr"
+		sync_mode="$(cat /sys/module/xpon_int/parameters/boot_probe_sync_mode)"
+		logger -t xg140g-pon "boot probe startup mode=$mode confirmed_rx_mode=$sync_mode before MAC init (0=unidentified)"
+	fi
+	if [ "$mode" = 1 ]; then
+		# Native MAC configures G.984 through the shared PHY provider at init.
+		# Load it once before the native MAC. A second load aborts startup.
+		load_module phy_10g $phy_args || return 1
+		phy_loaded=1
+		load_module xpon_gpon || return 1
+	else
+		load_module xpon_10g $xpon_args || return 1
+	fi
+
+	if [ "$phy_loaded" = 0 ]; then
+		load_module phy_10g $phy_args || return 1
+	fi
+
+	# Create the /dev/pon character device (major 190) for PHY ioctls
+	if [ ! -e /dev/pon ]; then
+		mknod -m 0600 /dev/pon c 190 0 || {
+			logger -t xg140g-pon "cannot create /dev/pon"
+			return 1
+		}
+	fi
+
+	# GPON/XG-PON/XGS-PON identity injection (modes 1/6/7).  Empty fields are
+	# skipped; present fields are normalized by pon-credentials at the fixed
+	# vendor ABI boundary.  No missing field may block PHY/OMCI startup.
+	if [ "$mode" = 1 ] || [ "$mode" = 6 ] || [ "$mode" = 7 ]; then
+		if [ -n "$gpon_sn$password$gpon_regid" ]; then
+			[ -x /usr/sbin/pon-credentials ] || {
+				logger -t xg140g-pon "pon-credentials helper missing"
+				return 1
+			}
+			printf '%s\0%s\0%s\0' "$gpon_sn" "$password" "$gpon_regid" |
+				/usr/sbin/pon-credentials /dev/pon "$ploam_format" "$regid_format" || {
+				logger -t xg140g-pon "GPON identity ioctl failed"
+				return 1
+			}
+		fi
+	fi
+
+	# The PON netdev now exists.  The PPE/NPU bridge is a hard prerequisite
+	# for this release: its init synchronously starts the NPU firmware and PPE
+	# FOE path.  Do not autoload it before pon exists and do not continue on
+	# failure with a software flowtable.
+	# Netfilter lifecycle observer is independent of the vendor hardware stack.
+	modprobe nf_flow_table || return 1
+	load_module pon_ppe_glue || {
+		logger -t xg140g-pon "mandatory PON PPE/NPU hardware bridge failed to load"
+		return 1
+	}
+	load_module pon_flow_guard || {
+		logger -t xg140g-pon "PON flow lifetime observer failed to load"
+		return 1
+	}
+	[ -x /usr/sbin/xg140g-npu-check ] || {
+		logger -t xg140g-pon "mandatory NPU health checker missing"
+		return 1
+	}
+	/usr/sbin/xg140g-npu-check || {
+		logger -t xg140g-pon "mandatory NPU firmware/PPE health gate failed"
+		return 1
+	}
+
+	# Bring pon UP before activation (QDMA INT1 single NAPI owner)
+	prepare_pon_wan || return 1
+
+	# Vendor activation sequence (userspace-triggered for all PON modes)
+	if [ ! -e "$STARTED_FILE" ]; then
+		case "$mode" in
+			5)
+				# This must happen before the first connection-start call;
+				# arming it later from xg140g-moded is too late for the
+				# vendor's one-shot startup sampling point.
+				arm_automode "$mode" || {
+					# Best-effort disarm closes the path if an implementation
+					# reports an arm error after changing hardware state.
+					disarm_automode "$mode" || true
+					return 1
+				}
+				automode_armed=1
+				;;
+		esac
+		# Both MAC providers implement the same scalar connection-start ioctl.
+		/usr/sbin/pon-moded --start-link || {
+			logger -t xg140g-pon "connection-start command delivery failed"
+			[ "$automode_armed" = 1 ] && disarm_automode "$mode" || true
+			return 1
+		}
+		if [ "$boot_probe" = 1 ] &&
+			[ "$(cat /sys/module/xpon_int/parameters/boot_probe_held 2>/dev/null)" != N ]; then
+			logger -t xg140g-pon "boot probe MAC/PHY handoff failed; TX remains inhibited"
+			return 1
+		fi
+		# Step 2: verify PHY reached initialized state
+		# /proc/pon_phy/debug 的 read 在 phy_init_done==FALSE 时返回
+		# -EACCES（cat 即失败）；初始化后的 Ready/Los 明细经 printk 落
+		# dmesg 而非 proc 输出，读一次触发打印并取证最近一条。
+		if ! cat /proc/pon_phy/debug >/dev/null 2>&1; then
+			logger -t xg140g-pon "PHY start did not reach initialized state"
+			[ "$automode_armed" = 1 ] && disarm_automode "$mode" || true
+			return 1
+		fi
+		dmesg 2>/dev/null | grep -E "PHY (Ready|Los)" | tail -1 | \
+			xargs -r logger -t xg140g-pon
+		# Step 3 (EPON only): dispatch EPON_MSG_DETECT_READY
+		case "$mode" in
+			2|3|4|5)
+				# r51 root-cause fix: never send "adapon 1" — it would
+				# overwrite the v40 calibration A2 table with template A0
+				# values (APC=0x21, ERC=0xEAA, IMOD=0x0), killing the laser
+				# (Imod 30mA->0mA, TxPwr 3.2dBm->-40dBm).  The en7572 module
+				# loads the real A2 at insmod time.  Here we only do a
+				# read-only calibration table trace, never write CSR.
+				if [ -w /proc/lddla/debug ]; then
+					/usr/bin/printf %s "apc_lut" > /proc/lddla/debug 2>/dev/null || true
+					/usr/bin/printf %s "erc_lut" > /proc/lddla/debug 2>/dev/null || true
+				fi
+				[ -w /proc/epon/debug ] || {
+					logger -t xg140g-pon "EPON debug proc node missing"
+					[ "$automode_armed" = 1 ] && disarm_automode "$mode" || true
+					return 1
+				}
+				/usr/bin/printf %s "epon phyready 1" > /proc/epon/debug || {
+					logger -t xg140g-pon "EPON detect-ready command delivery failed"
+					[ "$automode_armed" = 1 ] && disarm_automode "$mode" || true
+					return 1
+				}
+				# A successful write is not the command result.  Read back the
+				# vendor sysStartup field and require PON_WAN_START (0).
+				cat /proc/epon/debug 2>/dev/null | grep -q "^sysStartup=0$" || {
+					logger -t xg140g-pon "EPON detect-ready side-effect not observed"
+					[ "$automode_armed" = 1 ] && disarm_automode "$mode" || true
+					return 1
+				}
+				;;
+		esac
+		: > "$STARTED_FILE" || {
+			logger -t xg140g-pon "cannot record PON started state"
+			[ "$automode_armed" = 1 ] && disarm_automode "$mode" || true
+			return 1
+		}
+	fi
+
+	# Mode-gated OMCI/OAM daemon management
+	if [ "$mode" = 1 ] || [ "$mode" = 6 ] || [ "$mode" = 7 ]; then
+		# xg140g-omcid (START=41) is the sole boot-time OMCI owner.  Keeping
+		# this script from starting it at START=40 avoids duplicate procd
+		# instances; its stop path remains idempotent for manual teardown.
+		logger -t xg140g-pon "PON modules loaded mode=$mode (OMCI owned by START=41)"
+	else
+		omci_gate stop || {
+			logger -t xg140g-pon "OMCI stop failed for OAM mode=$mode"
+			disarm_automode "$mode" || true
+			return 1
+		}
+		logger -t xg140g-pon "PON modules loaded mode=$mode (OAM gate enabled)"
+	fi
+	if [ "$boot_probe" = 1 ]; then
+		/usr/sbin/pon-mode-store --boot-complete "$mode" "$PON_BOOT_ID" || return 1
+		rm -f /var/run/pon-boot-probe.pending
+		logger -t xg140g-pon "boot probe startup completed; recovery guard disarmed"
+	fi
+
+	# Rebind the flowtable to the registered provider without making PHY
+	# activation or the boot-probe watchdog depend on firewall configuration.
+	# Propagate a reload failure; a retry must not start the PHY a second time.
+	reload_fw4_after_glue || return 1
+}
+
+stop() {
+	local rc=0 mode
+	config_load xg140g-pon
+	mode="$(config_value mode)" || return 1
+	# Keep the vendor selector lifecycle symmetric with startup.  The daemon
+	# normally disarms first at STOP=61; this idempotent init-side call covers
+	# direct PON stops and remains a hard failure when the ABI cannot be called.
+	case "$mode" in
+		5) disarm_automode "$mode" || rc=1 ;;
+		0|1|2|3|4|6|7) ;;
+		*) logger -t xg140g-pon "invalid PON mode=$mode during stop"; rc=1 ;;
+	esac
+	omci_gate stop || rc=1
+	# Normal shutdown/reboot: kernel reclaims modules.
+	# Do NOT rmmod — qdma_wan teardown has panic risk and needs separate fix.
+	rm -f "$STARTED_FILE"
+	return "$rc"
+}
+
+# Vendor PON modules deliberately stay loaded on stop because their QDMA
+# teardown is unsafe.  A generic rc.common restart would therefore run a
+# second activation over live module parameters; require a reboot instead.
+restart() {
+	logger -t xg140g-pon "PON hot restart is unsupported; reboot to reinitialize the PON stack"
+	return 1
+}

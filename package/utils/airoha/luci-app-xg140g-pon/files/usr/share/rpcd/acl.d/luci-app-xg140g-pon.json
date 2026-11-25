@@ -1,0 +1,41 @@
+{
+  "luci-app-xg140g-pon": {
+    "description": "Grant LuCI access to XG-140G-TF PON configuration and status",
+    "read": {
+      "ubus": {
+        "luci.xg140g-pon": [
+          "status"
+        ],
+        "xg140g-pon-debug": [
+          "status",
+          "read",
+          "mode_status"
+        ]
+      },
+      "uci": [
+        "xg140g-pon"
+      ]
+    },
+    "write": {
+      "ubus": {
+        "luci.xg140g-pon": [
+          "reload",
+          "config_commit",
+          "begin_upload",
+          "abort_upload",
+          "upload_bosa",
+          "upload_ri",
+          "apply_calibration",
+          "clear_ac_mac"
+        ],
+        "xg140g-pon-debug": [
+          "start",
+          "mode_set"
+        ]
+      },
+      "uci": [
+        "network"
+      ]
+    }
+  }
+}

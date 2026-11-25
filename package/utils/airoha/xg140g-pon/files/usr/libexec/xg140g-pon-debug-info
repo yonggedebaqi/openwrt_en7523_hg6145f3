@@ -1,0 +1,173 @@
+#!/bin/sh
+# Fixed projections only. Never dump UCI credentials, process argv/environment,
+# procd service JSON, MIB payloads, calibration or factory identity data.
+export LC_ALL=C
+physical_port_names() {
+    for d in /sys/class/net/*; do
+        [ -d "$d" ] || continue
+        [ -r "$d/type" ] || continue
+        [ "$(cat "$d/type" 2>/dev/null)" = 1 ] || continue
+        [ -L "$d/device" ] || [ -L "$d/phydev" ] || continue
+        printf '%s\n' "${d##*/}"
+    done
+}
+case "$1" in
+identity)
+    # Keep original field names with masked values, plus presence/length for
+    # correlating saved fields with driver injection.
+    # Retain the permissive identity input policy; this does not validate or edit it.
+    for pair in 'gpon_sn itu_id' 'gpon_regid registration_code' 'loid epon_id' 'password auth' 'ploam_password ploam' 'omci_psk omci_security'; do
+        set -- $pair
+        value=$(uci -q get "xg140g-pon.onu.$1")
+        printf '%s=%s\n' "$1" "$([ -n "$value" ] && echo '***')"
+        printf '%s_configured=%s\n%s_text_octets=%s\n' "$2" "$([ -n "$value" ] && echo 1 || echo 0)" "$2" "${#value}"
+    done
+    # The legacy option is migration input only; runtime consumers are split.
+    echo auth_legacy_selected=0
+    printf 'credential_schema=%s\n' "$(uci -q get xg140g-pon.onu.credential_schema)"
+    ;;
+network)
+    uci -q show network | sed -n 's/^network\.\([^.=]*\)=\(interface\|device\|bridge-vlan\)$/\1/p' |
+    while IFS= read -r s; do
+        printf '\n--- network.%s ---\n' "$s"
+        for k in proto device ifname type name vid ports auto disabled force_link mtu metric defaultroute peerdns delegate ipv6 ipaddr netmask gateway dns ip6addr ip6gw ip6assign ip6class reqaddress reqprefix keepalive demand; do
+            v=$(uci -q get "network.$s.$k") || continue
+            printf '%s=%s\n' "$k" "$v"
+        done
+        # Keep credential field names; their values never enter the report.
+        for pair in 'username login_configured' 'password auth_configured'; do
+            set -- $pair
+            if [ -n "$(uci -q get "network.$s.$1")" ]; then
+                printf '%s=***\n%s=1\n' "$1" "$2"
+            fi
+        done
+    done
+    ;;
+firewall)
+    uci -q show firewall | sed -n 's/^firewall\.\([^.=]*\)=\(defaults\|zone\|forwarding\)$/\1/p' |
+    while IFS= read -r s; do
+        printf '\n--- firewall.%s ---\n' "$s"
+        for k in name network input output forward masq masq6 mtu_fix src dest flow_offloading flow_offloading_hw; do
+            v=$(uci -q get "firewall.$s.$k") || continue
+            printf '%s=%s\n' "$k" "$v"
+        done
+    done
+    ;;
+services)
+    . /usr/share/libubox/jshn.sh
+    # Parse private service JSON internally; emit only scalar lifecycle fields.
+    for svc in xg140g-pon xg140g-omcid xg140g-oam xg140g-moded network dnsmasq odhcpd; do
+        printf '\n--- service %s ---\n' "$svc"
+        data=$(ubus -t 2 call service list "{\"name\":\"$svc\"}" 2>/dev/null) || { echo unavailable; continue; }
+        json_load "$data" && json_select "$svc" && json_select instances || { echo no_instance; continue; }
+        json_get_keys instances
+        for inst in $instances; do
+            json_select "$inst" || continue
+            printf 'instance=%s\n' "$inst"
+            for k in running pid exit_code respawn_count; do
+                json_get_var v "$k"
+                case "$v" in ''|*[!0-9-]*) ;; *) printf '%s=%s\n' "$k" "$v" ;; esac
+            done
+            json_select ..
+        done
+    done
+    for name in omcid epon_oamd pon-moded pppd udhcpc odhcp6c; do
+        printf '\nprocess=%s\n' "$name"
+        ids=$(pidof "$name" 2>/dev/null)
+        [ -n "$ids" ] || { echo count=0; continue; }
+        for id in $ids; do
+            case "$id" in ''|*[!0-9]*) continue ;; esac
+            printf 'pid=%s\n' "$id"
+            sed -n '/^State:/p;/^VmRSS:/p;/^Threads:/p' "/proc/$id/status" 2>/dev/null
+        done
+    done
+    ;;
+links)
+    if ip -d -s link show 2>/dev/null; then :
+    else echo 'ip_details_unavailable=using_BusyBox_fallback'; ip link show; cat /proc/net/dev; fi
+    for d in /sys/class/net/*; do
+        printf '\n--- %s ---\n' "${d##*/}"
+        for k in operstate carrier speed duplex address flags mtu ifindex iflink; do
+            [ -r "$d/$k" ] || continue
+            printf '%s=' "$k"; cat "$d/$k" 2>/dev/null || echo unavailable
+        done
+        ls -d "$d"/lower_* "$d"/upper_* "$d"/brif/* 2>/dev/null || true
+    done
+    ;;
+lan-ports)
+    found=0
+    for dev in $(physical_port_names); do
+        d=/sys/class/net/$dev
+        found=1
+        printf '\n--- %s ---\n' "$dev"
+        if [ -L "$d/device" ]; then backing=device; else backing=phydev; fi
+        printf 'physical=1 type=1 backing=%s\n' "$backing"
+        for k in operstate carrier carrier_changes carrier_up_count carrier_down_count speed duplex address ifindex iflink; do
+            [ -r "$d/$k" ] || continue
+            printf '%s=' "$k"; cat "$d/$k" 2>/dev/null || echo unavailable
+        done
+    done
+    [ "$found" = 1 ] || echo 'UNAVAILABLE: physical LAN ports'
+    ;;
+topology)
+    . /usr/share/libubox/jshn.sh
+    data=$(ubus -t 2 call network.device status) || exit 1
+    json_load "$data" || exit 1
+    json_get_keys devices
+    for dev in $devices; do
+        json_select "$dev" || continue
+        printf '\n--- %s ---\n' "$dev"
+        for k in type devtype hw-tc-offload carrier; do
+            json_get_var value "$k"
+            printf '%s=%s\n' "$k" "${value:-unavailable}"
+        done
+        json_select ..
+    done
+    ;;
+leds)
+    for d in /sys/class/leds/*; do
+        [ -d "$d" ] || continue
+        printf '\n--- %s ---\n' "${d##*/}"
+        for k in brightness trigger device_name link; do
+            [ -r "$d/$k" ] || continue
+            printf '%s=' "$k"; cat "$d/$k"
+        done
+    done
+    ;;
+frequency)
+    found=0
+    for d in /sys/devices/system/cpu/cpufreq/policy*; do
+        [ -d "$d" ] || continue
+        found=1
+        printf '\n--- %s ---\n' "$d"
+        for k in affected_cpus scaling_driver scaling_governor scaling_cur_freq cpuinfo_cur_freq scaling_min_freq scaling_max_freq cpuinfo_min_freq cpuinfo_max_freq; do
+            printf '%s=' "$k"
+            cat "$d/$k" 2>/dev/null || echo unavailable
+        done
+    done
+    [ "$found" = 1 ] || echo 'UNAVAILABLE: cpufreq policies'
+    for d in /sys/class/thermal/thermal_zone*; do
+        [ -d "$d" ] || continue
+        printf '\n--- %s ---\n' "$d"
+        for k in type temp; do
+            printf '%s=' "$k"; cat "$d/$k" 2>/dev/null || echo unavailable
+        done
+    done
+    ;;
+placement)
+    for p in /sys/devices/system/cpu/online /proc/sys/net/core/rps_sock_flow_entries /proc/irq/*/smp_affinity_list /proc/irq/*/effective_affinity_list /sys/class/net/*/queues/rx-*/rps_cpus /sys/class/net/*/queues/rx-*/rps_flow_cnt /sys/class/net/*/queues/tx-*/xps_cpus; do
+        [ -r "$p" ] || continue
+        printf '%s=' "$p"; cat "$p" 2>/dev/null || echo unavailable
+    done
+    ;;
+resolver)
+    for f in /etc/resolv.conf /tmp/resolv.conf.d/resolv.conf.auto; do
+        printf '\n--- %s ---\n' "$f"
+        [ -r "$f" ] && sed -n '/^[[:space:]]*nameserver[[:space:]]/p' "$f"
+    done
+    # Route lookups send no packets and separate route selection from DNS.
+    ip -4 route get 1.1.1.1
+    ip -6 route get 2606:4700:4700::1111
+    ;;
+*) exit 2 ;;
+esac

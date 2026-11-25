@@ -1,0 +1,12 @@
+#!/bin/sh
+# Fill options absent from older releases; preserve explicit opt-outs and
+# automatic probe fallback. Commit both defaults together only if needed.
+case "$(uci -q get xg140g-pon.adapt)" in xg140g-pon|adapt) ;; *) exit 1 ;; esac
+changed=0
+for option in boot_probe cold_fallback; do
+	uci -q get "xg140g-pon.adapt.$option" >/dev/null && continue
+	uci set "xg140g-pon.adapt.$option=1" || exit 1
+	changed=1
+done
+[ "$changed" = 0 ] || uci commit xg140g-pon || exit 1
+exit 0

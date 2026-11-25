@@ -1,0 +1,274 @@
+/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
+/*
+ * linux/pon.h - PON (Passive Optical Network) userspace interface
+ *
+ * Reverse-engineered uapi header reconstructed from the blogic/pon-tool
+ * and blogic/omcid consumers (John Crispin, 2026).  The original kernel
+ * patch set that defines this interface was never published; the layout
+ * below is self-consistent with every user of the header and with the
+ * GPON/OMCI standards (G.984/G.988).  Enum values are assigned here and
+ * become the contract for a future in-kernel implementation.
+ *
+ * Scalar constants and the PON_DEV_F_ / PON_EVENT_F_ bit values live in
+ * <libpon/pon.h>, which is their authoritative source; this header only
+ * carries the wire enums.
+ */
+#ifndef PON_UAPI_INCLUDE
+#define PON_UAPI_INCLUDE
+
+#include <linux/types.h>
+
+#define PON_FAMILY_NAME		"pon"
+#define PON_FAMILY_VERSION	1
+
+/* PON link modes */
+enum pon_mode {
+	/* pon_mode_value("2") must yield XGS_PON through value_get()'s
+	 * [0 .. count-1] range, so the three names live at indices 0..2. */
+	PON_MODE_XG_PON		= 0,
+	PON_MODE_GPON		= 1,
+	PON_MODE_XGS_PON	= 2,
+};
+
+/* PLOAM activation states (G.984.3 O1..O7) */
+enum pon_ploam_state {
+	PON_PLOAM_STATE_UNKNOWN	= 0,
+	PON_PLOAM_STATE_O1,
+	PON_PLOAM_STATE_O2,
+	PON_PLOAM_STATE_O3,
+	PON_PLOAM_STATE_O4,
+	PON_PLOAM_STATE_O5,
+	PON_PLOAM_STATE_O6,
+	PON_PLOAM_STATE_O7,
+};
+
+/* Management classes */
+enum pon_cmd {
+	PON_CMD_UNSPEC,
+	PON_CMD_DEV_GET,
+	PON_CMD_DEV_SET,
+	PON_CMD_TCONT_GET,
+	PON_CMD_TCONT_SET,
+	PON_CMD_TCONT_DEL,
+	PON_CMD_GEM_GET,
+	PON_CMD_GEM_NEW,
+	PON_CMD_GEM_DEL,
+	PON_CMD_GEM_MAP_GET,
+	PON_CMD_GEM_MAP_NEW,
+	PON_CMD_GEM_MAP_DEL,
+	PON_CMD_GEM_STATS_GET,
+	PON_CMD_OMCI_REGISTER,
+	PON_CMD_OMCI_TX,
+	PON_CMD_OMCI_STATS_GET,
+	PON_CMD_TC_STATS_GET,
+	PON_CMD_XGTC_STATS_GET,
+	PON_CMD_PLOAM_DS_STATS_GET,
+	PON_CMD_PLOAM_US_STATS_GET,
+	PON_CMD_FEC_GET,
+	PON_CMD_MSK_SET,
+	PON_CMD_BCAST_KEY_SET,
+	PON_CMD_ALARM_GET,
+	PON_CMD_EVENT_GET,
+	/* kernel -> userspace notifications */
+	PON_CMD_DEV_ADD_NTF,
+	PON_CMD_DEV_CHANGE_NTF,
+	PON_CMD_DEV_DEL_NTF,
+	PON_CMD_TCONT_ADD_NTF,
+	PON_CMD_TCONT_CHANGE_NTF,
+	PON_CMD_TCONT_DEL_NTF,
+	PON_CMD_GEM_ADD_NTF,
+	PON_CMD_GEM_CHANGE_NTF,
+	PON_CMD_GEM_DEL_NTF,
+	PON_CMD_GEM_MAP_ADD_NTF,
+	PON_CMD_GEM_MAP_CHANGE_NTF,
+	PON_CMD_GEM_MAP_DEL_NTF,
+	PON_CMD_OMCI_NTF,
+	PON_CMD_PLOAM_NTF,
+	PON_CMD_EVENT_NTF,
+	PON_CMD_ALARM_NTF,
+	__PON_CMD_MAX,
+};
+#define PON_CMD_MAX (__PON_CMD_MAX - 1)
+
+enum pon_attr {
+	PON_A_UNSPEC,
+	/* device */
+	PON_A_DEV_ID,
+	PON_A_DEV_IFINDEX,
+	PON_A_DEV_ENABLE,
+	PON_A_DEV_DISABLED,
+	PON_A_DEV_MODE,
+	PON_A_DEV_MODES_CAP,
+	PON_A_DEV_SERIAL,
+	PON_A_DEV_REGISTRATION_ID,
+	PON_A_DEV_PLOAM_STATE,
+	PON_A_DEV_RESPONSE_TIME,
+	PON_A_DEV_MAX_TCONTS,
+	PON_A_DEV_MAX_GEMS,
+	PON_A_DEV_MSK,
+	PON_A_DEV_BCAST_KEY,
+	PON_A_DEV_BCAST_KEY_INDEX,
+	PON_A_DEV_MAX,
+	/* T-CONT */
+	PON_A_TCONT_DEV_ID,
+	PON_A_TCONT_INDEX,
+	PON_A_TCONT_ALLOC_ID,
+	PON_A_TCONT_MAX,
+	/* GEM port */
+	PON_A_GEM_DEV_ID,
+	PON_A_GEM_ID,
+	PON_A_GEM_TCONT_INDEX,
+	PON_A_GEM_NO_OFFLOAD,
+	PON_A_GEM_QUEUE,
+	PON_A_GEM_DIR,
+	PON_A_GEM_KEY_RING,
+	PON_A_GEM_MAX,
+	/* GEM mapper (802.1p / VLAN binding) */
+	PON_A_GEM_MAP_DEV_ID,
+	PON_A_GEM_MAP_IFINDEX,
+	PON_A_GEM_MAP_GEM_ID,
+	PON_A_GEM_MAP_PBIT,
+	PON_A_GEM_MAP_MAX,
+	/* GEM statistics */
+	PON_A_GEM_STATS_DEV_ID,
+	PON_A_GEM_STATS_GEM_ID,
+	PON_A_GEM_STATS_RX_BYTES,
+	PON_A_GEM_STATS_RX_FRAMES,
+	PON_A_GEM_STATS_TX_BYTES,
+	PON_A_GEM_STATS_TX_FRAMES,
+	PON_A_GEM_STATS_MAX,
+	/* OMCI channel */
+	PON_A_OMCI_DEV_ID,
+	PON_A_OMCI_PDU,
+	PON_A_OMCI_MAX,
+	PON_A_OMCI_STATS_DEV_ID,
+	PON_A_OMCI_STATS_RX,
+	PON_A_OMCI_STATS_RX_ERRORS,
+	PON_A_OMCI_STATS_RX_DROPPED,
+	PON_A_OMCI_STATS_TX,
+	PON_A_OMCI_STATS_TX_ERRORS,
+	PON_A_OMCI_STATS_MAX,
+	/* T-CONT statistics */
+	PON_A_TC_STATS_DEV_ID,
+	PON_A_TC_STATS_GROUPS,
+	PON_A_TC_STATS_PLOAM_DS,
+	PON_A_TC_STATS_PLOAM_US,
+	PON_A_TC_STATS_XGTC,
+	PON_A_TC_STATS_MAX,
+	/* XGTC statistics */
+	PON_A_XGTC_STATS_PSBD_HEC_ERRORS	= 1,
+	PON_A_XGTC_STATS_XGTC_HEC_ERRORS	= 2,
+	PON_A_XGTC_STATS_XGEM_HEC_ERRORS	= 3,
+	PON_A_XGTC_STATS_XGEM_HEC_LOST_WORDS	= 4,
+	PON_A_XGTC_STATS_XGEM_KEY_ERRORS	= 5,
+	PON_A_XGTC_STATS_RX_XGEM_BYTES	= 6,
+	PON_A_XGTC_STATS_TX_XGEM_BYTES	= 7,
+	PON_A_XGTC_STATS_TX_XGEM_FRAGMENTS	= 8,
+	PON_A_XGTC_STATS_TX_XGEM_FRAMES	= 9,
+	PON_A_XGTC_STATS_UNKNOWN_PROFILES	= 10,
+	PON_A_XGTC_STATS_LODS_EVENTS	= 11,
+	PON_A_XGTC_STATS_LODS_REACTIVATIONS	= 12,
+	PON_A_XGTC_STATS_LODS_RESTORED	= 13,
+	PON_A_XGTC_STATS_MAX	= 13,
+	/* PLOAM downstream statistics */
+	PON_A_PLOAM_DS_STATS_RX_PLOAM	= 1,
+	PON_A_PLOAM_DS_STATS_RX_REQUEST_REGISTRATION	= 2,
+	PON_A_PLOAM_DS_STATS_RX_ASSIGN_ONU_ID	= 3,
+	PON_A_PLOAM_DS_STATS_RX_DEACTIVATE_ONU_ID	= 4,
+	PON_A_PLOAM_DS_STATS_RX_DISABLE_SERIAL_NUMBER	= 5,
+	PON_A_PLOAM_DS_STATS_RX_ASSIGN_ALLOC_ID	= 6,
+	PON_A_PLOAM_DS_STATS_RX_KEY_CONTROL	= 7,
+	PON_A_PLOAM_DS_STATS_RX_SLEEP_ALLOW	= 8,
+	PON_A_PLOAM_DS_STATS_RX_BURST_PROFILE	= 9,
+	PON_A_PLOAM_DS_STATS_RX_RANGING_TIME	= 10,
+	PON_A_PLOAM_DS_STATS_PLOAM_MIC_ERRORS	= 11,
+	PON_A_PLOAM_DS_STATS_OMCI_MIC_ERRORS	= 12,
+	PON_A_PLOAM_DS_STATS_MAX	= 12,
+	/* PLOAM upstream statistics */
+	PON_A_PLOAM_US_STATS_TX_PLOAM	= 1,
+	PON_A_PLOAM_US_STATS_TX_SERIAL_NUMBER_ONU	= 2,
+	PON_A_PLOAM_US_STATS_TX_REGISTRATION	= 3,
+	PON_A_PLOAM_US_STATS_TX_KEY_REPORT	= 4,
+	PON_A_PLOAM_US_STATS_TX_ACKNOWLEDGE	= 5,
+	PON_A_PLOAM_US_STATS_TX_SLEEP_REQUEST	= 6,
+	PON_A_PLOAM_US_STATS_MAX	= 6,
+	/* FEC statistics */
+	PON_A_FEC_DEV_ID,
+	PON_A_FEC_SECONDS,
+	PON_A_FEC_TOTAL_CODEWORDS,
+	PON_A_FEC_CORRECTED_BYTES,
+	PON_A_FEC_CORRECTED,
+	PON_A_FEC_UNCORRECTABLE,
+	PON_A_FEC_MAX,
+	/* events */
+	PON_A_EVENT_DEV_ID,
+	PON_A_EVENT_TYPE,
+	PON_A_EVENT_IMAGE,
+	PON_A_EVENT_CALLS,
+	PON_A_EVENT_ALLOC_ID,
+	PON_A_EVENT_DEPTH,
+	PON_A_EVENT_MAX,
+	/* alarms */
+	PON_A_ALARM_DEV_ID,
+	PON_A_ALARM_ALARMS,
+	PON_A_ALARM_MAX,
+	__PON_A_MAX,
+};
+#define PON_A_MAX (__PON_A_MAX - 1)
+
+enum pon_event_type {
+	PON_EVENT_TYPE_UNSPEC,
+	PON_EVENT_TYPE_MIB_RESET_REQ,
+	PON_EVENT_TYPE_REBOOT_REQ,
+	PON_EVENT_TYPE_TCONT_ALLOC,
+	PON_EVENT_TYPE_TCONT_DEALLOC,
+	__PON_EVENT_TYPE_MAX,
+};
+#define PON_EVENT_TYPE_MAX (__PON_EVENT_TYPE_MAX - 1)
+
+/* GEM port direction */
+enum pon_gem_dir {
+	PON_GEM_DIR_UPSTREAM	= 1,
+	PON_GEM_DIR_DOWNSTREAM	= 2,
+	PON_GEM_DIR_BIDIR	= 3,
+};
+
+/* GEM encryption key ring */
+enum pon_gem_key_ring {
+	PON_GEM_KEY_RING_NONE		= 0,
+	PON_GEM_KEY_RING_UNICAST	= 1,
+	PON_GEM_KEY_RING_BROADCAST	= 2,
+	PON_GEM_KEY_RING_UNICAST_DOWNSTREAM = 3,
+};
+
+/* T-CONT statistics groups */
+enum pon_tc_stats_group {
+	/* libpon derives PON_TC_GROUPS as (PON_TC_STATS_GROUP_PLOAM_US + 1)
+	 * and indexes tc_groups[]/tc_group_names[] directly with these
+	 * values, so they must be consecutive from zero.  Wire masks are
+	 * formed as (1u << group). */
+	PON_TC_STATS_GROUP_XGTC		= 0,
+	PON_TC_STATS_GROUP_PLOAM_DS	= 1,
+	PON_TC_STATS_GROUP_PLOAM_US	= 2,
+};
+
+/* Reboot call reasons carried by the OLT reboot request */
+enum pon_reboot_calls {
+	PON_REBOOT_CALLS_ANY			= 0,
+	PON_REBOOT_CALLS_NO_CALLS		= 1,
+	PON_REBOOT_CALLS_NO_EMERGENCY_CALLS	= 2,
+};
+
+/* Alarm bit for loss-of-degradation-of-service */
+#define PON_ALARM_LODS			(1u << 0)
+
+/* Management multicast groups of the family */
+enum pon_mcgrp {
+	PON_MCGRP_UNSPEC,
+	PON_MCGRP_MGMT,
+	PON_MCGRP_STATE,
+	__PON_MCGRP_MAX,
+};
+#define PON_MCGRP_MAX (__PON_MCGRP_MAX - 1)
+
+#endif /* PON_UAPI_INCLUDE */

@@ -1,0 +1,231 @@
+#!/bin/sh
+# Own the one-shot multipart upload accepted by the PON calibration RPC.
+#
+# cgi-upload is intentionally kept as the multipart parser, but it is given a
+# server-generated filename from this helper.  The lease is a single global
+# gate: an upload is reserved, atomically claimed by the matching RPC token,
+# and then finished/aborted by that same token.  This is deliberately
+# fail-closed when a safe descriptor hand-off is unavailable; no fixed marker
+# is ever reused by two browser sessions.
+
+set -eu
+umask 077
+
+STATE_DIR=${XG140G_PON_UPLOAD_STATE_DIR:-/var/run/xg140g-pon-upload}
+UPLOAD_DIR=${XG140G_PON_UPLOAD_DIR:-/etc/luci-uploads}
+GATE=$STATE_DIR/gate
+STALE=3600
+
+valid_token() {
+	case "${1:-}" in
+		''|*[!A-Za-z0-9._-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_kind() {
+	case "${1:-}" in
+		bosa|ri) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+record_for() {
+	printf '%s/%s.lease\n' "$STATE_DIR" "$1"
+}
+
+claim_for() {
+	printf '%s/%s.claim\n' "$STATE_DIR" "$1"
+}
+
+path_for() {
+	printf '%s/xg140g-pon-%s-%s.bin\n' "$UPLOAD_DIR" "$1" "$2"
+}
+
+read_kind() {
+	sed -n 's/^kind=//p' "$1" 2>/dev/null | sed -n '1p'
+}
+
+read_owner() {
+	sed -n 's/^[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' "$GATE/owner" 2>/dev/null | sed -n '1p'
+}
+
+remove_owned_files() {
+	local token="$1" rec kind path
+	valid_token "$token" || return 0
+	for rec in "$(record_for "$token")" "$(claim_for "$token")"; do
+		[ -f "$rec" ] || continue
+		kind="$(read_kind "$rec" || true)"
+		valid_kind "$kind" || continue
+		path="$(path_for "$token" "$kind")"
+		case "$path" in
+			"$UPLOAD_DIR"/xg140g-pon-*.bin) rm -f -- "$path" ;;
+		esac
+		rm -f -- "$rec"
+	done
+}
+
+reap_stale_gate() {
+	local now mtime age owner
+	[ -d "$GATE" ] || return 0
+	now="$(date +%s)"
+	mtime="$(stat -c %Y "$GATE" 2>/dev/null || stat -f %m "$GATE" 2>/dev/null || echo 0)"
+	case "$mtime" in ''|*[!0-9]*) return 0 ;; esac
+	age=$((now - mtime))
+	[ "$age" -ge "$STALE" ] || return 0
+	owner="$(read_owner || true)"
+	remove_owned_files "$owner"
+	rm -f -- "$GATE/owner"
+	rmdir "$GATE" 2>/dev/null || true
+}
+
+ensure_dirs() {
+	mkdir -p "$STATE_DIR" "$UPLOAD_DIR"
+	chmod 0700 "$STATE_DIR" "$UPLOAD_DIR"
+}
+
+gate_owner_is() {
+	[ -d "$GATE" ] || return 1
+	[ "$(read_owner || true)" = "$1" ]
+}
+
+reservation_kind() {
+	local token="$1" rec
+	for rec in "$(record_for "$token")" "$(claim_for "$token")"; do
+		[ -f "$rec" ] || continue
+		read_kind "$rec"
+		return 0
+	done
+	return 1
+}
+
+require_token_kind() {
+	local token="$1" kind="$2" actual
+	valid_token "$token" && valid_kind "$kind" || exit 2
+	gate_owner_is "$token" || exit 1
+	actual="$(reservation_kind "$token" || true)"
+	[ "$actual" = "$kind" ] || exit 1
+}
+
+reserve() {
+	local token="$1" kind="$2" rec tmp path
+	valid_token "$token" && valid_kind "$kind" || exit 2
+	ensure_dirs
+	reap_stale_gate
+	if ! mkdir "$GATE" 2>/dev/null; then
+		exit 1
+	fi
+	tmp="$GATE/owner.$$"
+	printf '%s\n' "$token" > "$tmp"
+	chmod 0600 "$tmp"
+	mv -f -- "$tmp" "$GATE/owner"
+	rec="$(record_for "$token")"
+	path="$(path_for "$token" "$kind")"
+	tmp="$rec.$$"
+	{
+		printf 'kind=%s\n' "$kind"
+		printf 'path=%s\n' "$path"
+		printf 'state=reserved\n'
+	} > "$tmp"
+	chmod 0600 "$tmp"
+	if ! mv -f -- "$tmp" "$rec"; then
+		rm -f -- "$tmp"
+		rm -f -- "$GATE/owner"
+		rmdir "$GATE" 2>/dev/null || true
+		exit 1
+	fi
+	printf '%s\n' "$path"
+}
+
+path() {
+	local token="$1" kind="$2" rec claim actual expected state
+	require_token_kind "$token" "$kind"
+	rec="$(record_for "$token")"
+	claim="$(claim_for "$token")"
+	if [ -f "$rec" ]; then
+		actual="$rec"
+	else
+		actual="$claim"
+	fi
+	expected="$(path_for "$token" "$kind")"
+	path_value="$(sed -n 's/^path=//p' "$actual" | sed -n '1p')"
+	state="$(sed -n 's/^state=//p' "$actual" | sed -n '1p')"
+	[ "$path_value" = "$expected" ] || exit 1
+	case "$state" in reserved|claimed) ;; *) exit 1 ;; esac
+	printf '%s\n' "$expected"
+}
+
+take() {
+	local token="$1" kind="$2" rec claim path_value size owner uid
+	require_token_kind "$token" "$kind"
+	rec="$(record_for "$token")"
+	claim="$(claim_for "$token")"
+	[ -f "$rec" ] || exit 1
+	path_value="$(path "$token" "$kind")"
+	[ -f "$path_value" ] && [ ! -L "$path_value" ] || exit 1
+	size="$(wc -c < "$path_value" | tr -d '[:space:]')"
+	case "$size" in ''|*[!0-9]*) exit 1 ;; esac
+	[ "$size" -ge 1 ] && [ "$size" -le 262144 ] || exit 1
+	# busybox on the target ships no stat applet: read the numeric owner
+	# column from ls -ln instead.  A stat-based uid check made every take
+	# fail with invalid_upload on the device (R1.3.5 board-verify finding;
+	# the VM selftests never execute this line because they run non-root).
+	uid="$(ls -ln "$path_value" 2>/dev/null | awk '$3 ~ /^[0-9]+$/ { print $3; exit }')"
+	[ "$uid" = 0 ] || exit 1
+	chmod 0600 "$path_value" || exit 1
+	# The claim is the lock-protected ownership transfer.  The caller may only
+	# consume the path after this rename and only the same token may finish it.
+	mv -f -- "$rec" "$claim" || exit 1
+	sed -i.bak 's/^state=reserved$/state=claimed/' "$claim" || exit 1
+	rm -f -- "$claim.bak"
+	printf '%s\n' "$path_value"
+}
+
+finish_or_abort() {
+	local token="$1" op="$2" rec claim kind path_value
+	valid_token "$token" || exit 2
+	gate_owner_is "$token" || exit 1
+	rec="$(record_for "$token")"
+	claim="$(claim_for "$token")"
+	if [ -f "$claim" ]; then
+		# A public abort may only cancel an upload that has not been claimed by
+		# the matching RPC.  The calibration caller uses finish after consuming
+		# the claim; refusing abort here closes the unlink-while-read race for a
+		# duplicate/cancel request carrying the same token.
+		[ "$op" = finish ] || exit 1
+		kind="$(read_kind "$claim" || true)"
+		valid_kind "$kind" || exit 1
+		path_value="$(path_for "$token" "$kind")"
+		case "$path_value" in
+			"$UPLOAD_DIR"/xg140g-pon-*.bin) rm -f -- "$path_value" ;;
+			*) exit 1 ;;
+		esac
+		rm -f -- "$claim"
+	elif [ -f "$rec" ]; then
+		kind="$(read_kind "$rec" || true)"
+		valid_kind "$kind" || exit 1
+		path_value="$(path_for "$token" "$kind")"
+		rm -f -- "$path_value" "$rec"
+	else
+		exit 1
+	fi
+	rm -f -- "$GATE/owner"
+	rmdir "$GATE" 2>/dev/null || true
+	[ "$op" = finish ] || true
+}
+
+case "${1:-}" in
+	reserve)
+		[ "$#" = 3 ] || exit 2
+		reserve "$2" "$3" ;;
+	path)
+		[ "$#" = 3 ] || exit 2
+		path "$2" "$3" ;;
+	take)
+		[ "$#" = 3 ] || exit 2
+		take "$2" "$3" ;;
+	finish|abort)
+		[ "$#" = 2 ] || exit 2
+		finish_or_abort "$2" "$1" ;;
+	*) exit 2 ;;
+esac

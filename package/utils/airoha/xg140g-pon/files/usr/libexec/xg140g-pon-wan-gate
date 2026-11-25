@@ -1,0 +1,60 @@
+#!/bin/sh
+# Called after the active PON management family has proved its data bearer:
+# EPON/XEPON after CTC authentication plus LLID forwarding, ITU after OMCI.
+# Ordinary OpenWrt interfaces are intentionally outside this target-only gate.
+
+prepare_management() {
+	local status remaining=30
+	/usr/libexec/pon-network-prepare || return 1
+	# A global reload would apply unrelated shared UCI deltas even though the
+	# writer preserved them. Update only the reserved runtime interface.
+	status="$(ubus call network.interface.pon_mgmt status 2>/dev/null)"
+	if [ "$(printf '%s' "$status" | jsonfilter -e '@.proto' -e '@.device' 2>/dev/null)" = "$(printf 'none\npon')" ]; then
+		ubus call network.interface.pon_mgmt up >/dev/null 2>&1
+		return $?
+	fi
+	if [ -n "$status" ]; then
+		ubus call network.interface.pon_mgmt remove >/dev/null 2>&1 || return 1
+		# Removal includes asynchronous protocol teardown (e.g. old PPPoE).
+		# Wait for that instance to disappear before reusing its name.
+		while ubus -t 1 call network.interface.pon_mgmt status >/dev/null 2>&1; do
+			[ "$remaining" -gt 0 ] || return 1
+			remaining=$((remaining - 1))
+			sleep 1
+		done
+	fi
+	# Keep the dynamic RX/NAPI owner across optical carrier loss. The saved
+	# none/pon interface becomes the normal static owner on the next reload.
+	ubus call network add_dynamic '{"name":"pon_mgmt","proto":"none","device":"pon","auto":true,"force_link":true}' >/dev/null 2>&1
+}
+
+case "$1" in
+	prepare)
+		prepare_management || exit 1
+		;;
+	up)
+		ubus call network.interface.wan up >/dev/null 2>&1 || exit 1
+		ubus call network.interface.wan6 up >/dev/null 2>&1 || true
+		if [ "$(uci -q get network.pon_iptv.pon_managed)" = 1 ]; then
+			ubus call network.interface.pon_iptv up >/dev/null 2>&1 || exit 1
+            if [ "$(uci -q get network.pon_iptv6.pon_managed)" = 1 ]; then
+                ubus call network.interface.pon_iptv6 up >/dev/null 2>&1 || exit 1
+            fi
+		fi
+		;;
+	down)
+		ubus call network.interface.wan down >/dev/null 2>&1 || exit 1
+		ubus call network.interface.wan6 down >/dev/null 2>&1 || true
+		if [ "$(uci -q get network.pon_iptv.pon_managed)" = 1 ]; then
+			ubus call network.interface.pon_iptv down >/dev/null 2>&1 || exit 1
+            if [ "$(uci -q get network.pon_iptv6.pon_managed)" = 1 ]; then
+                ubus call network.interface.pon_iptv6 down >/dev/null 2>&1 || exit 1
+            fi
+		fi
+		;;
+	*)
+		exit 2
+		;;
+esac
+
+exit 0

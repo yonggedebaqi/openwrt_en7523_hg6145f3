@@ -1,0 +1,64 @@
+#!/bin/sh /etc/rc.common
+# All four boards use the common EN7581/EN7572 PON hardware profile.
+# The compiled DT model is not evidence of the physical unit after flashing.
+START=15
+
+known_model() {
+ case "$1" in xg140g-tf|xg040g-tf|xg140g-md|xg040g-md) return 0 ;; *) return 1 ;; esac
+}
+
+start() (
+ umask 077
+ local model source=unknown id=unknown pots=unknown dir tmp ri_tmp candidate display model_tmp
+ tmp="$(mktemp /var/run/pon-board.XXXXXX)" || exit 1
+ ri_tmp="$tmp.ri"
+ trap 'rm -f "$tmp" "$ri_tmp" "${model_tmp:-}"' 0
+ model="$(uci -q get xg140g-pon.hardware.model)" || model=auto
+ if known_model "$model"; then
+  source=configured
+ else
+  model=unknown
+  candidate="$(/usr/sbin/pon-board-profile /etc/lddla/ri.bin 2>/dev/null)" || candidate=""
+  if known_model "$candidate"; then
+   model="$candidate"; source=ri-file
+  elif /usr/libexec/xg140g-pon-native-factory ri > "$ri_tmp" 2>/dev/null &&
+       candidate="$(/usr/sbin/pon-board-profile "$ri_tmp" 2>/dev/null)" && known_model "$candidate"; then
+   model="$candidate"; source=ri-ubi-volume
+  else
+   # Only the named, bounded RI partition in a stock partition map is read.
+   # Flat UBI installations have no such partition and use a saved profile.
+   for dir in /sys/class/mtd/mtd[0-9]*; do
+    [ -d "$dir" ] || continue
+    [ "$(cat "$dir/name" 2>/dev/null)" = ri ] || continue
+    [ "$(cat "$dir/size" 2>/dev/null)" = 262144 ] || continue
+    dd if="/dev/${dir##*/}" of="$ri_tmp" bs=4096 count=64 2>/dev/null || continue
+    candidate="$(/usr/sbin/pon-board-profile "$ri_tmp" 2>/dev/null)" || candidate=""
+    if known_model "$candidate"; then
+     model="$candidate"; source=ri-partition
+     break
+    fi
+   done
+  fi
+ fi
+ case "$model" in
+  xg140g-tf) id=XG140GTF; pots=1; display="Nokia XG-140G-TF" ;;
+  xg040g-tf) id=XG040GTF; pots=0; display="Nokia XG-040G-TF" ;;
+  xg140g-md) id=XG140GMC2P5G; pots=1; display="Nokia XG-140G-MD" ;;
+  xg040g-md) id=XG040GMC2P5G; pots=0; display="Nokia XG-040G-MD" ;;
+  *) display="Nokia EN7581 ONU (model unknown)" ;;
+ esac
+ {
+  printf 'model=%s\nsource=%s\nboard_id=%s\npots=%s\n' "$model" "$source" "$id" "$pots"
+  printf 'hardware_profile=en7581-en7572\n'
+ } > "$tmp" || exit 1
+ chmod 0644 "$tmp" || exit 1
+ mv -f "$tmp" /var/run/pon-board.state || exit 1
+ # procd's system.board model reads this file before the compiled DT label.
+ # board_name/compatible remain the common image ABI used by sysupgrade.
+ mkdir -p /tmp/sysinfo || exit 1
+ model_tmp="$(mktemp /tmp/sysinfo/.model.XXXXXX)" || exit 1
+ printf '%s\n' "$display" > "$model_tmp" || exit 1
+ chmod 0644 "$model_tmp" || exit 1
+ mv -f "$model_tmp" /tmp/sysinfo/model || exit 1
+ logger -t xg140g-board "model=$model source=$source hardware=en7581-en7572"
+)

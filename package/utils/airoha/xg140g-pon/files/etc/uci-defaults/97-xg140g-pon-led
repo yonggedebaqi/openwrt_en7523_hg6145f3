@@ -1,0 +1,24 @@
+#!/bin/sh
+# config_generate skips system when sysupgrade preserves the old config.
+# Add the newly supported panel LED once, retaining any user LED assignment.
+[ -d /sys/class/leds/green:pon ] || exit 0
+. /lib/functions.sh
+
+pon_led_present=0
+find_pon_led() {
+ local sysfs
+ config_get sysfs "$1" sysfs
+ [ "$sysfs" != 'green:pon' ] || pon_led_present=1
+}
+config_load system || exit 1
+config_foreach find_pon_led led
+[ "$pon_led_present" = 0 ] || exit 0
+
+section="$(uci add system led)" || exit 1
+uci set "system.$section.name=PON" &&
+ uci set "system.$section.sysfs=green:pon" &&
+ uci set "system.$section.trigger=netdev" &&
+ uci set "system.$section.dev=pon" &&
+ uci set "system.$section.mode=link" &&
+ uci commit system || exit 1
+exit 0

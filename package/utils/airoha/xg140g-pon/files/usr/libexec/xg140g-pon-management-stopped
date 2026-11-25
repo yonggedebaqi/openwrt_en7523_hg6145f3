@@ -1,0 +1,14 @@
+#!/bin/sh
+# A successful procd delete only sends SIGTERM. Its instance remains visible
+# until the child exits; an unavailable ubus service cannot confirm exit.
+case "$1" in
+    oam|omcid) service="xg140g-$1" ;;
+    *) exit 2 ;;
+esac
+payload="$(ubus -t 2 call service list "{\"name\":\"$service\"}")" || exit 1
+jsonfilter -s "$payload" -e '@' >/dev/null || exit 1
+states="$(jsonfilter -s "$payload" -e "@['$service'].instances[*].running")"
+for state in $states; do
+    [ "$state" = false ] || exit 1
+done
+exit 0

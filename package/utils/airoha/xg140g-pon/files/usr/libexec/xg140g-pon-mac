@@ -1,0 +1,91 @@
+#!/bin/sh
+# Read the per-board MAC from the Airoha/Nokia U-Boot environment.
+#
+# The stock and tcboot XG-140G-TF images use different MTD labels and
+# environment layouts.  Keep the probe read-only with respect to U-Boot and
+# only create /etc/fw_env.config when --ensure is requested.  This helper is
+# deliberately limited to identity provisioning; it is not a data-plane
+# fallback.  xg140g-pon still requires the NPU/PPE hardware gate to pass.
+
+CONFIG=/etc/fw_env.config
+ENSURE=0
+
+case "${1:-}" in
+	"") ;;
+	--ensure) ENSURE=1 ;;
+	*) exit 2 ;;
+esac
+
+valid_mac() {
+	local mac first vendor_default_prefix='00:aa:bb:01:23:'
+	case "$1" in
+		[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]) ;;
+		*) return 1 ;;
+	esac
+	mac="$(printf '%s' "$1" | tr 'A-F' 'a-f')" || return 1
+	case "$mac" in
+		00:00:00:00:00:00|ff:ff:ff:ff:ff:ff) return 1 ;;
+		"${vendor_default_prefix}"??) return 1 ;;
+	esac
+	first="${mac%%:*}"
+	[ $((0x$first & 1)) -eq 0 ]
+}
+
+read_mac() {
+	local cfg="$1" mac
+	[ -x /usr/sbin/fw_printenv ] || return 1
+	[ -s "$cfg" ] || return 1
+	mac="$(fw_printenv -c "$cfg" -n ethaddr 2>/dev/null)" || return 1
+	valid_mac "$mac" || return 1
+	printf '%s\n' "$(printf '%s' "$mac" | tr 'A-F' 'a-f')"
+}
+
+env_mtd_index() {
+	awk -F: '
+		$1 ~ /^mtd[0-9]+$/ {
+			name=$2
+			if (name ~ /"u-boot-env"/ || name ~ /"env"/) {
+				idx=$1; sub(/^mtd/, "", idx); print idx; exit
+			}
+		}' /proc/mtd 2>/dev/null
+}
+
+make_candidate_config() {
+	local idx size
+	idx="$(env_mtd_index)"
+	[ -n "$idx" ] || return 1
+	size="$(cat "/sys/class/mtd/mtd${idx}/size" 2>/dev/null)"
+	case "$size" in
+		524288|0x80000)
+			printf '/dev/mtd%s 0x0 0x80000 0x20000 4\n' "$idx"
+			;;
+		131072|0x20000)
+			# Stock XG-140G-TF stores the 0x4000 environment at the end
+			# of the 0x20000 u-boot-env partition.
+			printf '/dev/mtd%s 0x1c000 0x4000 0x4000 1\n' "$idx"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+mac="$(read_mac "$CONFIG" 2>/dev/null || true)"
+if [ -z "$mac" ]; then
+	candidate="$(make_candidate_config 2>/dev/null || true)"
+	if [ -n "$candidate" ]; then
+		tmp="${CONFIG}.tmp.$$"
+		if [ "$ENSURE" = 1 ]; then
+			umask 022
+			if printf '%s' "$candidate" > "$tmp" && mv -f "$tmp" "$CONFIG"; then
+				:
+			else
+				rm -f "$tmp"
+			fi
+		fi
+		mac="$(printf '%s' "$candidate" > "${tmp}.read" 2>/dev/null &&
+			read_mac "${tmp}.read" 2>/dev/null || true)"
+		rm -f "${tmp}.read"
+	fi
+fi
+
+valid_mac "$mac" || exit 1
+printf '%s\n' "$mac"

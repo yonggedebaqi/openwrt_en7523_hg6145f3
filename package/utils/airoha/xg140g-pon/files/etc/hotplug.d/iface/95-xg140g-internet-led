@@ -1,0 +1,18 @@
+#!/bin/sh
+# WAN protocol events distinguish usable DHCP/PPPoE from PON carrier alone.
+[ "$INTERFACE" = wan ] || exit 0
+led=/sys/class/leds/green:internet
+[ -d "$led" ] || exit 0
+
+case "$ACTION" in
+	ifup|ifupdate)
+		[ -n "$DEVICE" ] || exit 0
+		printf '%s\n' netdev > "$led/trigger"
+		printf '%s\n' "$DEVICE" > "$led/device_name"
+		printf '%s\n' 1 > "$led/link"
+		;;
+	ifdown)
+		printf '%s\n' none > "$led/trigger"
+		printf '%s\n' 0 > "$led/brightness"
+		;;
+esac
